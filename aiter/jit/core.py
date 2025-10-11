@@ -43,6 +43,8 @@ def mp_lock(
     if baton.try_acquire():
         try:
             ret = MainFunc()
+        except Exception as e:
+            raise
         finally:
             if FinalFunc is not None:
                 FinalFunc()
