@@ -1468,6 +1468,7 @@ def _run_ninja_build(build_directory: str, verbose: bool, error_prefix: str) -> 
         command.extend(["-j", str(num_workers)])
     env = os.environ.copy()
 
+
     try:
         sys.stdout.flush()
         sys.stderr.flush()
@@ -1484,15 +1485,24 @@ def _run_ninja_build(build_directory: str, verbose: bool, error_prefix: str) -> 
         # To work around this, we pass in the fileno directly and hope that
         # it is valid.
         stdout_fileno = 1
-        subprocess.run(
+        
+        # Run without timeout and capture output
+        result = subprocess.run(
             command,
-            stdout=stdout_fileno if verbose else subprocess.PIPE,
-            stderr=subprocess.STDOUT,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
             cwd=build_directory,
             check=True,
             env=env,
+            text=True
         )
+        
     except subprocess.CalledProcessError as e:
+        print(f"❌ DEBUG: Ninja build failed with error: {e}")
+        print(f"❌ DEBUG: Return code: {e.returncode}")
+        print(f"❌ DEBUG: Command: {e.cmd}")
+        if hasattr(e, 'output') and e.output:
+            print(f"❌ DEBUG: Output: {e.output}")
         # Python 2 and 3 compatible way of getting the error object.
         _, error, _ = sys.exc_info()
         # error.output contains the stdout and stderr of the build attempt.
