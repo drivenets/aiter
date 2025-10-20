@@ -6,6 +6,7 @@
 
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m)
 {
-    AITER_ENUM_PYBIND;
+    // REMOVED: AITER_ENUM_PYBIND - enums already registered in module_aiter_enum
+    // This fixes "QuantType already registered" error in multi-GPU
     MOE_OP_PYBIND;
 }
