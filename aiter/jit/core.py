@@ -337,11 +337,22 @@ __mds = {}
 def get_module_custom_op(md_name: str) -> None:
     global __mds
     if md_name not in __mds:
-        if "AITER_JIT_DIR" in os.environ:
-            __mds[md_name] = importlib.import_module(md_name)
-        else:
-            __mds[md_name] = importlib.import_module(f"{__package__}.{md_name}")
-        logger.info(f"import [{md_name}] under {__mds[md_name].__file__}")
+        # Use file lock to synchronize imports across multi-GPU processes
+        # This prevents pybind11 "type already registered" errors
+        lock_file = f"/tmp/aiter_import_{md_name}.lock"
+        import fcntl
+        with open(lock_file, 'w') as lock_fd:
+            fcntl.flock(lock_fd.fileno(), fcntl.LOCK_EX)  # Exclusive lock
+            try:
+                # Check again after acquiring lock (another process may have imported)
+                if md_name not in __mds:
+                    if "AITER_JIT_DIR" in os.environ:
+                        __mds[md_name] = importlib.import_module(md_name)
+                    else:
+                        __mds[md_name] = importlib.import_module(f"{__package__}.{md_name}")
+                    logger.info(f"import [{md_name}] under {__mds[md_name].__file__}")
+            finally:
+                fcntl.flock(lock_fd.fileno(), fcntl.LOCK_UN)  # Release lock
     return
 
 
@@ -417,7 +428,9 @@ def build_module(
             )
 
         flags_cc = ["-O3", "-std=c++20"]
+        rocm_path = os.environ.get("ROCM_PATH") or os.environ.get("ROCM_HOME") or "/opt/rocm"
         flags_hip = [
+            f"--rocm-path={rocm_path}",
             "-DLEGACY_HIPBLAS_DIRECT",
             "-DUSE_PROF_API=1",
             "-D__HIP_PLATFORM_HCC__=1",
@@ -436,7 +449,14 @@ def build_module(
         ]
 
         # Imitate https://github.com/ROCm/composable_kernel/blob/c8b6b64240e840a7decf76dfaa13c37da5294c4a/CMakeLists.txt#L190-L214
-        hip_version = parse(get_hip_version().split()[-1].rstrip("-").replace("-", "+"))
+        hip_version_str = get_hip_version().strip()
+        # Handle version string format (e.g., "7.0.0" or "HIP version: 7.0.0")
+        if hip_version_str:
+            parts = hip_version_str.split()
+            version_part = parts[-1] if parts else "7.0.0"
+            hip_version = parse(version_part.rstrip("-").replace("-", "+"))
+        else:
+            hip_version = parse("7.0.0")
         if hip_version <= Version("6.3.42132"):
             flags_hip += ["-mllvm --amdgpu-enable-max-ilp-scheduling-strategy=1"]
         if hip_version > Version("5.5.00000"):
