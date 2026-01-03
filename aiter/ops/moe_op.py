@@ -456,6 +456,9 @@ dtype2str_dict = {
     dtypes.fp4x2: "fp4x2",
     torch.uint32: "i4",
     torch.int4: "i4",
+    # Explicit FP8 types for gfx942 and gfx950
+    torch.float8_e4m3fnuz: "f8",  # gfx942
+    torch.float8_e4m3fn: "f8",    # gfx950
 }
 
 str2dtype_dict = {

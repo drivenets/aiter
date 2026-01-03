@@ -278,15 +278,20 @@ def per_group_quant_hip(
         128,
     ], f"unsupported group size {group_size=}, only support [32, 64, 128]"
     y = torch.empty(shape, dtype=quant_dtype, device=device)
+    # Ensure tensors are contiguous for CUDA kernel compatibility
+    x_cont = x.contiguous()
+    x_view = x_cont.view(-1, group_size).contiguous()
+    scale_cont = scale.contiguous()
+    
     dynamic_per_token_scaled_quant(
         y,
-        x.view(-1, group_size),
-        scale,
+        x_view,
+        scale_cont,
         shuffle_scale=transpose_scale,
         num_rows=num_rows,
         num_rows_factor=num_rows_factor,
     )
-    return y, scale
+    return y, scale_cont
 
 
 def per_1x32_f4_quant_hip(

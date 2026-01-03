@@ -129,17 +129,13 @@ template torch::Tensor
         INSTANCE_dFP32_eFP16 = INSTANCE_template.format(name=k.name, dtypes="F32, F16")
         # TODO: dFP8_eFP8
 
-        if self.istune:
-            Path(
-                os.path.join(self.instances_path, f"{k.name}_dFP32_eBF16.cpp")
-            ).write_text(INSTANCE_dFP32_eBF16)
-        else:
-            Path(
-                os.path.join(self.instances_path, f"{k.name}_dFP32_eBF16.cpp")
-            ).write_text(INSTANCE_dFP32_eBF16)
-            Path(
-                os.path.join(self.instances_path, f"{k.name}_dFP32_eFP16.cpp")
-            ).write_text(INSTANCE_dFP32_eFP16)
+        # Always generate both BF16 and FP16 output types
+        Path(
+            os.path.join(self.instances_path, f"{k.name}_dFP32_eBF16.cpp")
+        ).write_text(INSTANCE_dFP32_eBF16)
+        Path(
+            os.path.join(self.instances_path, f"{k.name}_dFP32_eFP16.cpp")
+        ).write_text(INSTANCE_dFP32_eFP16)
 
     def gen_lookup_dict(self, kernels_dict):
         LOOKUP_head = """#pragma once
