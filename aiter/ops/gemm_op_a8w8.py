@@ -21,6 +21,37 @@ from ..ops.gemm_op_common import get_padded_m
 
 aiter_lib = Library("aiter", "FRAGMENT")
 
+# NOTE: Buffer pool workarounds for FP8 GEMM CK bug are DISABLED.
+# The CK FP8 GEMM has a critical bug that crashes with "illegal memory access" when
+# many large FP8 tensors exist in GPU memory (e.g., Llama 70B with >~2.4GB FP8 weight data).
+# Once triggered, GPU state is corrupted until hardware reset.
+#
+# The bug appears to be in the CK kernel or HIP runtime's handling of FP8 tensor memory,
+# not in buffer pool management. The workaround buffers below did not fix the issue.
+# 
+# vLLM routes FP8 GEMM through hipBLASLt (torch._scaled_mm) instead, which is stable.
+# INT8 GEMM still uses CK GEMM since it works correctly.
+#
+# These pools are kept but DISABLED for reference:
+_fp8_gemm_buffer_pool = {}
+_FP8_GEMM_BUFFER_POOL_ENABLED = False  # DISABLED - vLLM uses hipBLASLt for FP8
+
+_fp8_weight_workspace_pool = {}
+_FP8_WEIGHT_WORKSPACE_ENABLED = False  # DISABLED - vLLM uses hipBLASLt for FP8
+_FP8_MAX_WEIGHT_BUFFERS_PER_SHAPE = 2
+
+def _get_fp8_weight_workspace(n: int, k: int, dtype: torch.dtype, device: torch.device) -> torch.Tensor:
+    """Get a workspace buffer for weight data from a limited pool. (UNUSED)"""
+    global _fp8_weight_workspace_pool
+    key = (n, k, dtype, str(device))
+    if key not in _fp8_weight_workspace_pool:
+        _fp8_weight_workspace_pool[key] = torch.empty(n, k, dtype=dtype, device=device)
+    return _fp8_weight_workspace_pool[key]
+
+_FP8_WEIGHT_POOL_ENABLED = False  # DISABLED - vLLM uses hipBLASLt for FP8
+_fp8_weight_pool = {}
+_FP8_WEIGHT_POOL_SIZE = 4
+
 
 def gen_gemm_a8w8_ck_fake_tensors(
     XQ: torch.Tensor,
@@ -432,6 +463,21 @@ def gemm_a8w8_ASM(
     return gemm_a8w8_asm(XQ, WQ, x_scale, w_scale, Y, kernelName, bias, splitK=1)
 
 
+def _get_fp8_gemm_buffer(m: int, n: int, k: int, input_dtype: torch.dtype, 
+                          output_dtype: torch.dtype, device: torch.device) -> dict:
+    """Get or create pre-allocated buffers for FP8 GEMM to avoid memory bugs."""
+    global _fp8_gemm_buffer_pool
+    
+    key = (m, n, k, input_dtype, output_dtype, str(device))
+    if key not in _fp8_gemm_buffer_pool:
+        _fp8_gemm_buffer_pool[key] = {
+            'A': torch.empty(m, k, dtype=input_dtype, device=device),
+            'B': torch.empty(n, k, dtype=input_dtype, device=device),
+            'Y': torch.empty(m, n, dtype=output_dtype, device=device),
+        }
+    return _fp8_gemm_buffer_pool[key]
+
+
 def gemm_a8w8_CK(
     XQ: Tensor,
     WQ: Tensor,
@@ -458,8 +504,47 @@ def gemm_a8w8_CK(
             splitK = ck_config["splitK"]
         else:
             splitK = 0
-    Y = torch.empty(m, n, dtype=dtype, device=XQ.device)
-    return gemm_a8w8_ck(XQ, WQ, x_scale, w_scale, Y, bias, splitK)
+    
+    # Use buffer pool for FP8 to avoid memory deallocation bug
+    is_fp8 = XQ.dtype in (torch.float8_e4m3fn, torch.float8_e4m3fnuz, 
+                          torch.float8_e5m2, torch.float8_e5m2fnuz)
+    
+    if _FP8_WEIGHT_WORKSPACE_ENABLED and is_fp8:
+        # Use workspace buffers to minimize unique FP8 allocations
+        # This works around a CK bug that crashes with >49 unique FP8 tensor allocations
+        buffers = _get_fp8_gemm_buffer(m, n, k, XQ.dtype, dtype, XQ.device)
+        weight_buf = _get_fp8_weight_workspace(n, k, WQ.dtype, WQ.device)
+        
+        # Copy data to workspace buffers
+        buffers['A'].copy_(XQ)
+        weight_buf.copy_(WQ)
+        
+        # Sync before kernel
+        torch.cuda.synchronize()
+        
+        result = gemm_a8w8_ck(buffers['A'], weight_buf, x_scale, w_scale, 
+                              buffers['Y'], bias, splitK)
+        
+        # Sync after kernel
+        torch.cuda.synchronize()
+        
+        return result.clone()
+    elif _FP8_GEMM_BUFFER_POOL_ENABLED and is_fp8:
+        buffers = _get_fp8_gemm_buffer(m, n, k, XQ.dtype, dtype, XQ.device)
+        # Copy inputs to pre-allocated buffers
+        buffers['A'].copy_(XQ)
+        buffers['B'].copy_(WQ)
+        # Sync before kernel to ensure copies are complete
+        torch.cuda.synchronize()
+        result = gemm_a8w8_ck(buffers['A'], buffers['B'], x_scale, w_scale, 
+                              buffers['Y'], bias, splitK)
+        # Sync after kernel before returning
+        torch.cuda.synchronize()
+        # Return a copy of the result (so caller can modify it)
+        return result.clone()
+    else:
+        Y = torch.empty(m, n, dtype=dtype, device=XQ.device)
+        return gemm_a8w8_ck(XQ, WQ, x_scale, w_scale, Y, bias, splitK)
 
 
 def gemm_a8w8_bpreshuffle_fake(
