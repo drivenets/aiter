@@ -218,9 +218,10 @@ void moe_gemm(const MoeFlatmmHostArgs& args, const ck_stream_config& s)
                                              FlatmmConfig::N_Warp_Tile,
                                              FlatmmConfig::K_Warp_Tile,
                                              CodegenPipelineProblem::TransposeC,
-                                             FlatmmConfig::NumWaveGroups,
-                                             false,
-                                             1,
+                                             ck_tile::memory_operation_enum::set,  // MemoryOperation
+                                             FlatmmConfig::NumWaveGroups,          // kNumWaveGroups
+                                             false,                                // FixedVectorSize
+                                             1,                                    // VectorSizeC
                                              FlatmmConfig::TiledMMAPermuteN,
                                              BlockedXDLN_PerWarp>>;
 
