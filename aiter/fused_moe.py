@@ -776,6 +776,8 @@ def get_2stage_cfgs(
         and q_type == QuantType.per_1x32
         and activation == ActivationType.Swiglu
     ):
+        # Use tuned block_m if available, otherwise use heuristic
+        effective_block_m = block_m if cfg is not None else get_block_m()
         return MOEMetadata(
             functools.partial(
                 cktile_moe_stage1,
@@ -789,7 +791,7 @@ def get_2stage_cfgs(
                 k_pad_zeros=intermediate_pad // 128 * 128,
                 activation=activation,
             ),
-            get_block_m(),
+            effective_block_m,
             ksplit,
             False,
             True,

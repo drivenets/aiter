@@ -400,3 +400,15 @@ cu_num,token,model_dim,inter_dim,expert,topk,act_type,dtype,q_dtype_a,q_dtype_w,
 256,512,7168,256,257,9,ActivationType.Silu,torch.bfloat16,torch.float8_e4m3fn,torch.float8_e4m3fn,QuantType.per_1x128,1,0,32,0,353.0405,_ZN5aiter47fmoe_bf16_blockscaleFp8_g1u1_vs_silu_1tg_32x256E,0.0%,0.0,Null,0.0%,353.0405,1,143.71,4038.63
 256,1024,7168,256,257,9,ActivationType.Silu,torch.bfloat16,torch.float8_e4m3fn,torch.float8_e4m3fn,QuantType.per_1x128,1,0,32,0,386.5823,_ZN5aiter49fmoe_bf16_blockscaleFp8_g1u1_novs_silu_1tg_32x256E,0.0%,0.0,Null,0.0%,386.5823,1,262.48,3716.7
 256,2048,7168,256,257,9,ActivationType.Silu,torch.bfloat16,torch.float8_e4m3fn,torch.float8_e4m3fn,QuantType.per_1x128,1,0,32,0,637.2087,_ZN5aiter47fmoe_bf16_blockscaleFp8_g1u1_vs_silu_1tg_32x256E,0.0%,0.0,Null,0.0%,637.2087,1,318.48,2289.41
+256,1,3072,512,128,4,ActivationType.Swiglu,torch.bfloat16,torch.bfloat16,torch.float4_e2m1fn_x2,QuantType.per_1x32,1,0,16,0,0,cktile_moe_stage1,0.0%,0,cktile_moe_stage2,0.0%,76.15,0,0.50,0
+256,2,3072,512,128,4,ActivationType.Swiglu,torch.bfloat16,torch.bfloat16,torch.float4_e2m1fn_x2,QuantType.per_1x32,1,0,16,0,0,cktile_moe_stage1,0.0%,0,cktile_moe_stage2,0.0%,73.36,0,1.03,0
+256,4,3072,512,128,4,ActivationType.Swiglu,torch.bfloat16,torch.bfloat16,torch.float4_e2m1fn_x2,QuantType.per_1x32,1,0,16,0,0,cktile_moe_stage1,0.0%,0,cktile_moe_stage2,0.0%,72.69,0,2.08,0
+256,8,3072,512,128,4,ActivationType.Swiglu,torch.bfloat16,torch.bfloat16,torch.float4_e2m1fn_x2,QuantType.per_1x32,1,0,16,0,0,cktile_moe_stage1,0.0%,0,cktile_moe_stage2,0.0%,75.77,0,3.99,0
+256,16,3072,512,128,4,ActivationType.Swiglu,torch.bfloat16,torch.bfloat16,torch.float4_e2m1fn_x2,QuantType.per_1x32,1,0,16,0,0,cktile_moe_stage1,0.0%,0,cktile_moe_stage2,0.0%,80.06,0,7.54,0
+256,32,3072,512,128,4,ActivationType.Swiglu,torch.bfloat16,torch.bfloat16,torch.float4_e2m1fn_x2,QuantType.per_1x32,1,0,16,0,0,cktile_moe_stage1,0.0%,0,cktile_moe_stage2,0.0%,88.57,0,13.64,0
+256,64,3072,512,128,4,ActivationType.Swiglu,torch.bfloat16,torch.bfloat16,torch.float4_e2m1fn_x2,QuantType.per_1x32,1,0,16,0,0,cktile_moe_stage1,0.0%,0,cktile_moe_stage2,0.0%,103.97,0,23.24,0
+256,128,3072,512,128,4,ActivationType.Swiglu,torch.bfloat16,torch.bfloat16,torch.float4_e2m1fn_x2,QuantType.per_1x32,1,0,16,0,0,cktile_moe_stage1,0.0%,0,cktile_moe_stage2,0.0%,109.53,0,44.11,0
+256,256,3072,512,128,4,ActivationType.Swiglu,torch.bfloat16,torch.bfloat16,torch.float4_e2m1fn_x2,QuantType.per_1x32,1,0,16,0,0,cktile_moe_stage1,0.0%,0,cktile_moe_stage2,0.0%,111.44,0,86.72,0
+256,512,3072,512,128,4,ActivationType.Swiglu,torch.bfloat16,torch.bfloat16,torch.float4_e2m1fn_x2,QuantType.per_1x32,1,0,32,0,0,cktile_moe_stage1,0.0%,0,cktile_moe_stage2,0.0%,131.85,0,146.59,0
+256,1024,3072,512,128,4,ActivationType.Swiglu,torch.bfloat16,torch.bfloat16,torch.float4_e2m1fn_x2,QuantType.per_1x32,1,0,32,0,0,cktile_moe_stage1,0.0%,0,cktile_moe_stage2,0.0%,157.95,0,244.72,0
+256,2048,3072,512,128,4,ActivationType.Swiglu,torch.bfloat16,torch.bfloat16,torch.float4_e2m1fn_x2,QuantType.per_1x32,1,0,32,0,0,cktile_moe_stage1,0.0%,0,cktile_moe_stage2,0.0%,205.33,0,376.52,0
