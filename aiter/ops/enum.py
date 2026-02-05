@@ -14,3 +14,5 @@ def _QuantType(dummy): ...
 
 ActivationType = type(_ActivationType(0))
 QuantType = type(_QuantType(0))
+
+__all__ = ["ActivationType", "QuantType"]
