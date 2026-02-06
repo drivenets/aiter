@@ -123,7 +123,8 @@ __global__ __launch_bounds__(NUM_THREADS) void paged_attention_ll4mi_reduce_kern
     const int* __restrict__ kv_last_page_lens, // [num_seqs]
     const int block_size,
     const int max_num_partitions,
-    const float* __restrict__ fp8_out_scale_ptr)
+    const float* __restrict__ fp8_out_scale_ptr,
+    const float* __restrict__ sink_ptr)        // [num_heads] - attention sink values per head (can be nullptr)
 {
     const int num_heads = gridDim.x;
     const auto MTP = gridDim.z;
@@ -140,7 +141,7 @@ __global__ __launch_bounds__(NUM_THREADS) void paged_attention_ll4mi_reduce_kern
         context_len = kv_indptr[seq_idx + 1] - kv_indptr[seq_idx];
     }
     const int64_t query_loc = static_cast<int64_t>(seq_idx * MTP);
-    _paged_attention_ll4mi_reduce_kernel<scalar_t, OUTT, HEAD_SIZE, NUM_THREADS, PARTITION_SIZE, NPAR_LOOPS>(query_loc, context_len, out, exp_sums, max_logits, tmp_out, max_num_partitions, fp8_out_scale_ptr);
+    _paged_attention_ll4mi_reduce_kernel<scalar_t, OUTT, HEAD_SIZE, NUM_THREADS, PARTITION_SIZE, NPAR_LOOPS>(query_loc, context_len, out, exp_sums, max_logits, tmp_out, max_num_partitions, fp8_out_scale_ptr, sink_ptr);
 }
 
 #else // !defined(__HIP__MI3XX_MI250__) TODO: Add NAVI support
@@ -207,7 +208,8 @@ __global__ __launch_bounds__(NUM_THREADS) void paged_attention_ll4mi_reduce_kern
     const int* __restrict__ kv_last_page_lens, // [num_seqs]
     const int block_size,
     const int max_num_partitions,
-    const float* __restrict__ fp8_out_scale_ptr)
+    const float* __restrict__ fp8_out_scale_ptr,
+    const float* __restrict__ sink_ptr)        // [num_heads] - attention sink values per head (can be nullptr)
 {
     UNREACHABLE_CODE
 }

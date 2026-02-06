@@ -511,6 +511,7 @@ def paged_attention_ragged(
     fp8_out_scale: Optional[torch.Tensor] = None,
     partition_size: int = 256,
     mtp: int = 1,
+    sink_ptr: Optional[torch.Tensor] = None,  # [num_heads] - attention sink values per head
 ) -> torch.Tensor:
     paged_attention_ragged_core(
         out,
@@ -533,6 +534,7 @@ def paged_attention_ragged(
         fp8_out_scale,
         partition_size,
         mtp,
+        sink_ptr=sink_ptr,
     )
     return out
 
