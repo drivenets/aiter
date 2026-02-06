@@ -904,7 +904,8 @@ __inline__ __device__ void _paged_attention_ll4mi_reduce_kernel(
     const scalar_t* __restrict__ tmp_out, // [num_seqs*mtp, num_heads,
                                           // max_num_partitions, head_size]
     const int max_num_partitions,
-    const float* __restrict__ fp8_out_scale_ptr)
+    const float* __restrict__ fp8_out_scale_ptr,
+    const float* __restrict__ sink_ptr)   // [num_heads] - attention sink values per head (can be nullptr)
 {
     const int num_heads = gridDim.x;
     const int head_idx  = blockIdx.x;
@@ -992,6 +993,14 @@ __inline__ __device__ void _paged_attention_ll4mi_reduce_kernel(
         for(int mask = WARP_SIZE / 2; mask >= 1; mask /= 2)
         {
             global_exp_sum += __shfl_xor(global_exp_sum, mask);
+        }
+        // Add sink contribution if sink_ptr is provided
+        // sink_ptr contains pre-computed attention sink values per head
+        // We add exp(sink_value - max_logit) to the softmax denominator
+        if(sink_ptr != nullptr && threadIdx.x == 0)
+        {
+            float sink_value = sink_ptr[head_idx];
+            global_exp_sum += expf(sink_value - max_logit);
         }
         if(threadIdx.x == 0)
         {

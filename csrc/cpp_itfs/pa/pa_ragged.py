@@ -84,6 +84,7 @@ def paged_attention_ragged(
     partition_size=256,
     mtp=1,
     q_scale=None,
+    sink_ptr=None,  # [num_heads] - attention sink values per head
 ):
     import torch
     from csrc.cpp_itfs.torch_utils import torch_to_c_types
@@ -209,6 +210,11 @@ def paged_attention_ragged(
         if q_scale is not None
         else ctypes.POINTER(ctypes.c_float)()
     )
+    sink_ptr_c = (
+        ctypes.cast(sink_ptr.data_ptr(), ctypes.POINTER(ctypes.c_float))
+        if sink_ptr is not None
+        else ctypes.POINTER(ctypes.c_float)()
+    )
     func(
         out_ptr,
         workspace_buffer_ptr,
@@ -223,6 +229,7 @@ def paged_attention_ragged(
         k_scale_ptr,
         v_scale_ptr,
         fp8_out_scale_ptr,
+        sink_ptr_c,
         scale,
         logits_soft_cap,
         num_seqs,
