@@ -756,7 +756,14 @@ def get_2stage_cfgs(
         if q_dtype_a == dtypes.fp8:
             return 32
         else:
-            return 16 if token < 2048 else 32 if token < 16384 else 64
+            if token < 2048:
+                return 16
+            elif token < 16384:
+                return 32
+            elif token < 65536:
+                return 64
+            else:
+                return 128
 
     if run_1stage:
         return MOEMetadata(
