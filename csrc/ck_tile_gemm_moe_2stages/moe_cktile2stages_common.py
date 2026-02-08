@@ -154,11 +154,21 @@ a8w8_gemm2_kernels_list= {
 # gemm1 out:bf16/fp16 AB:bf16/fp4
 a16w4_gemm1_kernels_list_gfx950= {
     #  kernel:           stage| BLOCK_SIZE|MPerBLOCK|  NPerBLOCK| KPerBLOCK| WAVE_TILE_M| WAVE_TILE_N| WAVE_TILE_K| WAVE_MAP_M| WAVE_MAP_N|| BlockPerCU|
-    0: kernelInstance(       1,        256,       16,        128,       256,           16,         16,          32,          1,           4,          2,),
-    # 5: kernelInstance(       1,        256,       16,        512,       256,           16,         16,          32,          1,           4,          4,),
-    1: kernelInstance(       1,        256,       32,        256,       256,           16,         16,          32,          1,           4,          2,),
+    # === block_m=16 default + variants (select via AITER_MOE_G1_VARIANT env var) ===
+    0: kernelInstance(       1,        256,       16,        128,       256,           16,         16,          32,          1,           4,          2,),\
+   20: kernelInstance(       1,        256,       16,        256,       256,           16,         16,          32,          1,           4,          2,),\
+   21: kernelInstance(       1,        256,       16,        512,       256,           16,         16,          32,          1,           4,          4,),\
+   22: kernelInstance(       1,        256,       16,        128,       256,           16,         16,          32,          1,           4,          4,),\
+    # === block_m=32 default + variants ===
+    1: kernelInstance(       1,        256,       32,        256,       256,           16,         16,          32,          1,           4,          2,),\
+   30: kernelInstance(       1,        256,       32,        128,       256,           16,         16,          32,          1,           4,          3,),\
+   31: kernelInstance(       1,        256,       32,        256,       256,           16,         16,          32,          1,           4,          3,),\
+   32: kernelInstance(       1,        256,       32,        256,       256,           16,         16,          32,          1,           4,          1,),\
+    # === block_m=48 (new M granularity) ===
+   10: kernelInstance(       1,        256,       48,        256,       256,           16,         16,          32,          1,           4,          2,),\
+    # === block_m=64, 128 (existing) ===
     3: kernelInstance(       1,        256,       64,        256,       256,           16,         16,          32,          1,           4,          1,),
-    # 4: kernelInstance(       1,        256,      128,        256,       256,           16,         16,          32,          1,           4,          1,),
+    4: kernelInstance(       1,        256,      128,        256,       256,           16,         16,          32,          1,           4,          1,),
 }
 # gemm1 out:bf16/fp16 AB:bf16/fp4
 a16w4_gemm1_kernels_list= {
@@ -183,13 +193,21 @@ a16w4_gemm2_kernels_list= {
 # gemm2 out:bf16/fp16 AB:bf16/fp4
 a16w4_gemm2_kernels_list_gfx950= {
     #  kernel:           stage| BLOCK_SIZE|MPerBLOCK|  NPerBLOCK| KPerBLOCK| WAVE_TILE_M| WAVE_TILE_N| WAVE_TILE_K| WAVE_MAP_M| WAVE_MAP_N| BlockPerCU|
-    0: kernelInstance(       2,        256,       16,        128,       256,           16,         16,          32,          1,        4,            2,),
-    # 5: kernelInstance(       2,        256,       16,        512,       256,           16,         16,          32,          1,        4,            4,),
-    1: kernelInstance(       2,        256,       32,        256,       256,           16,         16,          32,          1,        4,            2,),
+    # === block_m=16 default + variants (select via AITER_MOE_G2_VARIANT env var) ===
+    0: kernelInstance(       2,        256,       16,        128,       256,           16,         16,          32,          1,        4,            2,),\
+   20: kernelInstance(       2,        256,       16,        128,       512,           16,         16,          32,          1,        4,            2,),\
+   21: kernelInstance(       2,        256,       16,        256,       256,           16,         16,          32,          1,        4,            3,),\
+   22: kernelInstance(       2,        256,       16,        256,       512,           16,         16,          32,          1,        4,            2,),\
+    # === block_m=32 default + variants ===
+    1: kernelInstance(       2,        256,       32,        256,       256,           16,         16,          32,          1,        4,            2,),\
+   30: kernelInstance(       2,        256,       32,        256,       512,           16,         16,          32,          1,        4,            2,),\
+   31: kernelInstance(       2,        256,       32,        256,       256,           16,         16,          32,          1,        4,            3,),\
+   32: kernelInstance(       2,        256,       32,        128,       256,           16,         16,          32,          1,        4,            3,),\
+    # === block_m=48 (new M granularity) ===
+   10: kernelInstance(       2,        256,       48,        256,       256,           16,         16,          32,          1,        4,            2,),\
+    # === block_m=64, 128 (existing) ===
     3: kernelInstance(       2,        256,       64,        256,       256,           16,         16,          32,          1,        4,            1,),
-    # 4: kernelInstance(       2,        256,      128,        256,       128,           16,         16,          32,          1,        4,            1,),
-    # 4: kernelInstance(       2,        256,      256,        256,       256,           16,         16,          32,          1,        4,),
-    # 4: kernelInstance(       2,        256,      256,        128,       128,           16,         16,          32,          1,        4,),
+    4: kernelInstance(       2,        256,      128,        256,       256,           16,         16,          32,          1,        4,            1,),
 }
 
 # gemm1 out:bf16/fp16 AB:fp8/fp4
@@ -309,30 +327,55 @@ a16w4_gfx950_heuristic_dispatch = """#pragma once
 // Copyright (C) 2024-2025, Advanced Micro Devices, Inc. All rights reserved.
 #include "moe_cktile2stages.h"
 #include "moe_cktile2stages_heuristic_dispatch_common.h"
+#include <cstdlib>
 
 template <>
 struct moe_gemm1_heuristic_dispatcher<{(a_data_type)}, {(b_data_type)}, {(acc_data_type)}, {(c_data_type)}, {(activation)}, {(has_bias)}, {(split_k)}>
 {{
     static MoeKernel dispatch(int M, int N, int K, int block_m)
     {{
-        // Apply shape heuristics to find a suitable kernel implementation.
+        const char* _var = std::getenv("AITER_MOE_G1_VARIANT");
+        int variant = _var ? std::atoi(_var) : 0;
+
         if (block_m == 16)
         {{
+            // v0: N=128 K=256 BPC=2 (default)
+            // v1: N=256 K=256 BPC=2 (wider N tile)
+            // v2: N=512 K=256 BPC=4 (very wide N, max occupancy)
+            // v3: N=128 K=256 BPC=4 (same tile, max occupancy)
+            if (variant == 1) return {(1, 20)}<{(a_data_type)}, {(b_data_type)}, {(acc_data_type)}, {(c_data_type)}>;
+            if (variant == 2) return {(1, 21)}<{(a_data_type)}, {(b_data_type)}, {(acc_data_type)}, {(c_data_type)}>;
+            if (variant == 3) return {(1, 22)}<{(a_data_type)}, {(b_data_type)}, {(acc_data_type)}, {(c_data_type)}>;
             return {(1, 0)}<{(a_data_type)}, {(b_data_type)}, {(acc_data_type)}, {(c_data_type)}>;
         }}
         else if (block_m == 32)
         {{
+            // v0: N=256 K=256 BPC=2 (default)
+            // v1: N=128 K=256 BPC=3 (narrower N, higher occupancy)
+            // v2: N=256 K=256 BPC=3 (same tile, higher occupancy)
+            // v3: N=256 K=256 BPC=1 (lower occupancy, more resources per block)
+            if (variant == 1) return {(1, 30)}<{(a_data_type)}, {(b_data_type)}, {(acc_data_type)}, {(c_data_type)}>;
+            if (variant == 2) return {(1, 31)}<{(a_data_type)}, {(b_data_type)}, {(acc_data_type)}, {(c_data_type)}>;
+            if (variant == 3) return {(1, 32)}<{(a_data_type)}, {(b_data_type)}, {(acc_data_type)}, {(c_data_type)}>;
             return {(1, 1)}<{(a_data_type)}, {(b_data_type)}, {(acc_data_type)}, {(c_data_type)}>;
+        }}
+        else if (block_m == 48)
+        {{
+            return {(1, 10)}<{(a_data_type)}, {(b_data_type)}, {(acc_data_type)}, {(c_data_type)}>;
         }}
         else if (block_m == 64)
         {{
             return {(1, 3)}<{(a_data_type)}, {(b_data_type)}, {(acc_data_type)}, {(c_data_type)}>;
         }}
+        else if (block_m == 128)
+        {{
+            return {(1, 4)}<{(a_data_type)}, {(b_data_type)}, {(acc_data_type)}, {(c_data_type)}>;
+        }}
         else
         {{
             TORCH_CHECK(
                 false,
-                "Unsupported block_m value for moe_geem1 heuristic dispatch: ",
+                "Unsupported block_m value for moe_gemm1 heuristic dispatch: ",
                 block_m);
         }}
     }}
@@ -343,18 +386,42 @@ struct moe_gemm2_heuristic_dispatcher<{(a_data_type)}, {(b_data_type)}, {(acc_da
 {{
     static MoeKernel dispatch(int M, int N, int K, int block_m)
     {{
-        // Apply shape heuristics to find a suitable kernel implementation.
+        const char* _var = std::getenv("AITER_MOE_G2_VARIANT");
+        int variant = _var ? std::atoi(_var) : 0;
+
         if (block_m == 16)
         {{
+            // v0: N=128 K=256 BPC=2 (default)
+            // v1: N=128 K=512 BPC=2 (full K pass for K=512!)
+            // v2: N=256 K=256 BPC=3 (wider N, higher occupancy)
+            // v3: N=256 K=512 BPC=2 (wide N + full K pass)
+            if (variant == 1) return {(2, 20)}<{(a_data_type)}, {(b_data_type)}, {(acc_data_type)}, {(c_data_type)}>;
+            if (variant == 2) return {(2, 21)}<{(a_data_type)}, {(b_data_type)}, {(acc_data_type)}, {(c_data_type)}>;
+            if (variant == 3) return {(2, 22)}<{(a_data_type)}, {(b_data_type)}, {(acc_data_type)}, {(c_data_type)}>;
             return {(2, 0)}<{(a_data_type)}, {(b_data_type)}, {(acc_data_type)}, {(c_data_type)}>;
         }}
         else if (block_m == 32)
         {{
+            // v0: N=256 K=256 BPC=2 (default)
+            // v1: N=256 K=512 BPC=2 (full K pass for K=512!)
+            // v2: N=256 K=256 BPC=3 (higher occupancy)
+            // v3: N=128 K=256 BPC=3 (narrower N, higher occupancy)
+            if (variant == 1) return {(2, 30)}<{(a_data_type)}, {(b_data_type)}, {(acc_data_type)}, {(c_data_type)}>;
+            if (variant == 2) return {(2, 31)}<{(a_data_type)}, {(b_data_type)}, {(acc_data_type)}, {(c_data_type)}>;
+            if (variant == 3) return {(2, 32)}<{(a_data_type)}, {(b_data_type)}, {(acc_data_type)}, {(c_data_type)}>;
             return {(2, 1)}<{(a_data_type)}, {(b_data_type)}, {(acc_data_type)}, {(c_data_type)}>;
+        }}
+        else if (block_m == 48)
+        {{
+            return {(2, 10)}<{(a_data_type)}, {(b_data_type)}, {(acc_data_type)}, {(c_data_type)}>;
         }}
         else if (block_m == 64)
         {{
             return {(2, 3)}<{(a_data_type)}, {(b_data_type)}, {(acc_data_type)}, {(c_data_type)}>;
+        }}
+        else if (block_m == 128)
+        {{
+            return {(2, 4)}<{(a_data_type)}, {(b_data_type)}, {(acc_data_type)}, {(c_data_type)}>;
         }}
         else
         {{
