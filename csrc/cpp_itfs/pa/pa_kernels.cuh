@@ -323,7 +323,14 @@ _paged_attention_kernel(const int* block_table_seq,
     if constexpr(KV_DTYPE != vllm::Fp8KVCacheDataType::kAuto)
     {
         // multiply by k_scale if fp8 kv cache
-        scale2 *= *k_scale_ptr;
+        // On gfx950, the FP8 MFMA instruction (mfma_f32_16x16x32_fp8_fp8)
+        // produces 2x the expected dot product. Apply 0.5 correction.
+#if defined(__gfx950__)
+        constexpr float FP8_MFMA_CORRECTION = 0.5f;
+#else
+        constexpr float FP8_MFMA_CORRECTION = 1.0f;
+#endif
+        scale2 *= *k_scale_ptr * FP8_MFMA_CORRECTION;
     }
 
     const auto variant_params = [&] {
@@ -337,6 +344,48 @@ _paged_attention_kernel(const int* block_table_seq,
             return ck_tile::StandardAttentionParams<Mask>{mask, scale2};
         }
     }();
+
+    // Pre-convert Q from BF16 to FP8 once (hoisted out of the token loop).
+    // Q values don't change across tokens, so converting inside the TLOOP
+    // wastes ~75% of the conversion cost on redundant bf16->fp8 conversions.
+    _T8x8 Q_fp8[GQA_RATIO_LOOP][HEAD_LOOP][MTP_PER_THREAD][QKHELOOP][QK_SIZE_RATIO];
+    if constexpr(KV_DTYPE != vllm::Fp8KVCacheDataType::kAuto)
+    {
+        for(int mtp = 0; mtp < mtp_loop; mtp++)
+        {
+            for(int gqa_ratio_loop = 0; gqa_ratio_loop < GQA_RATIO_LOOP; gqa_ratio_loop++)
+            {
+                for(int head_loop = 0; head_loop < HEAD_LOOP; head_loop++)
+                {
+                    for(int qkhe_depth = 0; qkhe_depth < QKHELOOP; qkhe_depth++)
+                    {
+                        for(int qkratio = 0; qkratio < QK_SIZE_RATIO; qkratio++)
+                        {
+                            for(int i = 0; i < 2; i++)
+                            {
+                                scalar_t* qptr = reinterpret_cast<scalar_t*>(
+                                    &Qlocal[gqa_ratio_loop][head_loop][mtp][qkhe_depth][qkratio]
+                                         .xy[i]);
+
+                                Q_fp8[gqa_ratio_loop][head_loop][mtp][qkhe_depth][qkratio]
+                                    .b16x4[i * 2] = __builtin_amdgcn_cvt_pk_fp8_f32(
+                                        to_float<scalar_t>(qptr[0]) * q_scale,
+                                        to_float<scalar_t>(qptr[1]) * q_scale,
+                                        0,
+                                        false);
+                                Q_fp8[gqa_ratio_loop][head_loop][mtp][qkhe_depth][qkratio]
+                                    .b16x4[i * 2 + 1] = __builtin_amdgcn_cvt_pk_fp8_f32(
+                                        to_float<scalar_t>(qptr[2]) * q_scale,
+                                        to_float<scalar_t>(qptr[3]) * q_scale,
+                                        0,
+                                        false);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
 
     floatx4 d_out[GQA_RATIO_LOOP][MTP_PER_THREAD][TLOOP];
     // qk mfma
@@ -376,36 +425,18 @@ _paged_attention_kernel(const int* block_table_seq,
                             }
                         }
                         else
-                        { // kv cache dtype fp8
+                        { // kv cache dtype fp8 — use pre-converted Q_fp8
                             auto Ktmp       = Klocal[head_loop][token_depth][qkhe_depth];
                             _B8x16 Ktmp8x16 = *reinterpret_cast<_B8x16*>(&Ktmp);
                             for(int qkratio = 0; qkratio < QK_SIZE_RATIO; qkratio++)
                             {
-                                _T8x8 Ktmp8x8, Qtmp8x8;
+                                _T8x8 Ktmp8x8;
                                 Ktmp8x8.b8x8 = Ktmp8x16.xy[qkratio];
-
-                                for(int i = 0; i < 2; i++)
-                                {
-                                    scalar_t* qptr = reinterpret_cast<scalar_t*>(
-                                        &Qlocal[gqa_ratio_loop][head_loop][mtp][qkhe_depth][qkratio]
-                                             .xy[i]);
-
-                                    Qtmp8x8.b16x4[i * 2] = __builtin_amdgcn_cvt_pk_fp8_f32(
-                                        to_float<scalar_t>(qptr[0]) * q_scale,
-                                        to_float<scalar_t>(qptr[1]) * q_scale,
-                                        0,
-                                        false);
-                                    Qtmp8x8.b16x4[i * 2 + 1] = __builtin_amdgcn_cvt_pk_fp8_f32(
-                                        to_float<scalar_t>(qptr[2]) * q_scale,
-                                        to_float<scalar_t>(qptr[3]) * q_scale,
-                                        0,
-                                        false);
-                                }
 
                                 d_out[gqa_ratio_loop][mtp][token_depth] =
                                     gcn_mfma16x16x32_instr<__hip_fp8_e4m3, 0, 0, 0>(
                                         Ktmp8x8.i64,
-                                        Qtmp8x8.i64,
+                                        Q_fp8[gqa_ratio_loop][head_loop][mtp][qkhe_depth][qkratio].i64,
                                         d_out[gqa_ratio_loop][mtp][token_depth]);
                             }
                         }
@@ -807,7 +838,13 @@ _paged_attention_kernel(const int* block_table_seq,
                 // apply post Softmax V mfma v_scale
                 if constexpr(KV_DTYPE != vllm::Fp8KVCacheDataType::kAuto)
                 {
+                    // On gfx950, the FP8 MFMA produces 2x the expected result;
+                    // apply same 0.5 correction as in the QK path.
+#if defined(__gfx950__)
+                    tmp_out *= *v_scale_ptr * 0.5f;
+#else
                     tmp_out *= *v_scale_ptr;
+#endif
                 }
                 outelems[gqa_ratio_loop][mtp][vhe_depth] = from_floatx4<scalar_t>(tmp_out);
             }
@@ -1487,7 +1524,11 @@ __inline__ __device__ void _paged_attention_kernel_EXPERIMENTAL(
     if constexpr(KV_DTYPE != vllm::Fp8KVCacheDataType::kAuto)
     {
         // multiply by k_scale if fp8 kv cache
+#if defined(__gfx950__)
+        scale2 *= *k_scale_ptr * 0.5f;
+#else
         scale2 *= *k_scale_ptr;
+#endif
     }
 
     const auto variant_params = [&] {
@@ -2164,7 +2205,11 @@ __inline__ __device__ void _paged_attention_kernel_EXPERIMENTAL(
                 // apply post Softmax V mfma v_scale
                 if constexpr(KV_DTYPE != vllm::Fp8KVCacheDataType::kAuto)
                 {
+#if defined(__gfx950__)
+                    tmp_out *= *v_scale_ptr * 0.5f;
+#else
                     tmp_out *= *v_scale_ptr;
+#endif
                 }
                 outelems[gqa_ratio_loop][mtp][vhe_depth] = from_floatx4<scalar_t>(tmp_out);
             }
