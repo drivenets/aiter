@@ -62,7 +62,7 @@ torch.set_default_device("cuda")
 
 # GPT-OSS MoE parameters
 MODEL_DIM = 3072
-INTER_DIM = 512
+INTER_DIM = 3072
 EXPERTS = 128
 TOPK = 4
 DTYPE = dtypes.bf16
