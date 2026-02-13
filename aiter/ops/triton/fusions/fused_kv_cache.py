@@ -4,6 +4,7 @@ from typing import Tuple
 from aiter.ops.triton._triton_kernels.fusions.fused_kv_cache import (
     _fused_qk_rope_cat_and_cache_mla_kernel,
     _fused_qk_rope_reshape_and_cache_kernel,
+    _fused_qk_rope_reshape_and_cache_tiled_kernel,
     _fused_qk_rope_cosine_cache_llama_kernel,
 )
 from aiter.jit.utils.torch_guard import torch_compile_guard
@@ -298,9 +299,21 @@ def fused_qk_rope_reshape_and_cache(
     if flash_layout:
         t_cache, block_size, kh_cache, dk_cache = key_cache.shape
         t_cache_v, block_size_v, vh_cache, dv_cache = value_cache.shape
+        value_shuffle_layout = False
     else:
         t_cache, kh_cache, dkx_cache, block_size, x_cache = key_cache.shape
-        t_cache_v, vh_cache, dv_cache, block_size_v = value_cache.shape
+        if value_cache.ndim == 5:
+            # value_cache shuffle: (num_blocks, num_kv_heads, block_size // x, head_size, x)
+            t_cache_v, vh_cache, slot_chunk_v, dv_cache, x_v = value_cache.shape
+            value_shuffle_layout = True
+            block_size_v = slot_chunk_v * x_v
+            assert block_size_v == block_size and x_v == x_cache, (
+                f"value_cache shuffle (T,KH,block_size//x,D,x) must match key: "
+                f"{block_size_v=} {block_size=} {x_v=} {x_cache=}"
+            )
+        else:
+            t_cache_v, vh_cache, dv_cache, block_size_v = value_cache.shape
+            value_shuffle_layout = False
     (t_slot,) = slot_mapping.shape
 
     assert (
@@ -353,61 +366,149 @@ def fused_qk_rope_reshape_and_cache(
     else:
         zeros_out = None
 
-    n_pid = t * qh + (t_slot - t) * kh
-    grid = (n_pid, 1, 1)
-    _fused_qk_rope_reshape_and_cache_kernel[grid](
-        q,
-        k,
-        v,
-        pos,
-        cos,
-        sin,
-        offs,
-        key_cache,
-        value_cache,
-        slot_mapping,
-        q_out,
-        k_out,
-        zeros_out,
-        t,
-        t_slot,
-        *q.stride(),
-        *k.stride(),
-        *v.stride(),
-        cos.stride(0),
-        cos.stride(-1),
-        *q_out.stride(),
-        *k_out.stride(),
-        key_cache.stride(0) if not flash_layout else key_cache.stride(0),
-        key_cache.stride(1) if not flash_layout else key_cache.stride(2),
-        key_cache.stride(2) if not flash_layout else key_cache.stride(3),
-        key_cache.stride(3) if not flash_layout else key_cache.stride(1),
-        key_cache.stride(4) if not flash_layout else 0,
-        value_cache.stride(0) if not flash_layout else value_cache.stride(0),
-        value_cache.stride(1) if not flash_layout else value_cache.stride(2),
-        value_cache.stride(2) if not flash_layout else value_cache.stride(3),
-        value_cache.stride(3) if not flash_layout else value_cache.stride(1),
-        zeros_out.stride(0) if zeros_out is not None else 0,
-        zeros_out.stride(1) if zeros_out is not None else 0,
-        zeros_out.stride(2) if zeros_out is not None else 0,
-        k_scale_ptr=k_scale,
-        v_scale_ptr=v_scale,
-        QH_PER_KH=qh // kh,
-        QH=qh,
-        KH=kh,
-        REUSE_FREQS_FRONT_PART=reuse_freqs_front_part,
-        IS_NEOX=is_neox,
-        BLOCK_D_pe=d,
-        BLOCK_D_HALF_pe=d // 2,
-        BLOCK_SIZE=block_size,
-        X_SIZE=x_cache if not flash_layout else 0,
-        FLASH_LAYOUT=flash_layout,
-        HAVE_POS=(offs is not None),
-        HAVE_K_SCALE=(k_scale is not None and apply_scale),
-        HAVE_V_SCALE=(v_scale is not None and apply_scale),
-        HAVE_ZEROS=output_zeros,
-        num_warps=1,
-    )
+    # Choose tiled kernel for decode (t == t_slot) when QH is divisible by tile size.
+    # The tiled kernel processes HEADS_PER_BLOCK Q-heads per block, reducing total
+    # blocks from T*QH to T*(QH/HPB) + extra KV blocks.  This cuts launch overhead
+    # dramatically for small-batch decode (e.g. 4096 blocks -> 512 blocks).
+    _HEADS_PER_BLOCK = 8
+    use_tiled = (t == t_slot and qh >= _HEADS_PER_BLOCK and qh % _HEADS_PER_BLOCK == 0)
+
+    if use_tiled:
+        num_q_groups = qh // _HEADS_PER_BLOCK
+        n_pid = t * num_q_groups + (t_slot - t) * kh
+        grid = (n_pid, 1, 1)
+        _fused_qk_rope_reshape_and_cache_tiled_kernel[grid](
+            q,
+            k,
+            v,
+            pos,
+            cos,
+            sin,
+            offs,
+            key_cache,
+            value_cache,
+            slot_mapping,
+            q_out,
+            k_out,
+            zeros_out,
+            t,
+            t_slot,
+            *q.stride(),
+            *k.stride(),
+            *v.stride(),
+            cos.stride(0),
+            cos.stride(-1),
+            *q_out.stride(),
+            *k_out.stride(),
+            key_cache.stride(0) if not flash_layout else key_cache.stride(0),
+            key_cache.stride(1) if not flash_layout else key_cache.stride(2),
+            key_cache.stride(2) if not flash_layout else key_cache.stride(3),
+            key_cache.stride(3) if not flash_layout else key_cache.stride(1),
+            key_cache.stride(4) if not flash_layout else 0,
+            value_cache.stride(0) if not flash_layout else value_cache.stride(0),
+            value_cache.stride(1) if not flash_layout else value_cache.stride(2),
+            (
+                value_cache.stride(3)
+                if (not flash_layout and value_shuffle_layout)
+                else (value_cache.stride(2) if not flash_layout else value_cache.stride(3))
+            ),
+            (
+                0
+                if (not flash_layout and value_shuffle_layout)
+                else (value_cache.stride(3) if not flash_layout else value_cache.stride(1))
+            ),
+            value_cache.stride(2) if (not flash_layout and value_shuffle_layout) else 0,
+            value_cache.stride(4) if (not flash_layout and value_shuffle_layout) else 0,
+            zeros_out.stride(0) if zeros_out is not None else 0,
+            zeros_out.stride(1) if zeros_out is not None else 0,
+            zeros_out.stride(2) if zeros_out is not None else 0,
+            k_scale_ptr=k_scale,
+            v_scale_ptr=v_scale,
+            QH_PER_KH=qh // kh,
+            QH=qh,
+            KH=kh,
+            REUSE_FREQS_FRONT_PART=reuse_freqs_front_part,
+            IS_NEOX=is_neox,
+            BLOCK_D_pe=d,
+            BLOCK_D_HALF_pe=d // 2,
+            BLOCK_SIZE=block_size,
+            X_SIZE=x_cache if not flash_layout else 0,
+            FLASH_LAYOUT=flash_layout,
+            VALUE_SHUFFLE_LAYOUT=value_shuffle_layout,
+            HEADS_PER_BLOCK=_HEADS_PER_BLOCK,
+            HAVE_POS=(offs is not None),
+            HAVE_K_SCALE=(k_scale is not None and apply_scale),
+            HAVE_V_SCALE=(v_scale is not None and apply_scale),
+            HAVE_ZEROS=output_zeros,
+            num_warps=1,
+        )
+    else:
+        n_pid = t * qh + (t_slot - t) * kh
+        grid = (n_pid, 1, 1)
+        _fused_qk_rope_reshape_and_cache_kernel[grid](
+            q,
+            k,
+            v,
+            pos,
+            cos,
+            sin,
+            offs,
+            key_cache,
+            value_cache,
+            slot_mapping,
+            q_out,
+            k_out,
+            zeros_out,
+            t,
+            t_slot,
+            *q.stride(),
+            *k.stride(),
+            *v.stride(),
+            cos.stride(0),
+            cos.stride(-1),
+            *q_out.stride(),
+            *k_out.stride(),
+            key_cache.stride(0) if not flash_layout else key_cache.stride(0),
+            key_cache.stride(1) if not flash_layout else key_cache.stride(2),
+            key_cache.stride(2) if not flash_layout else key_cache.stride(3),
+            key_cache.stride(3) if not flash_layout else key_cache.stride(1),
+            key_cache.stride(4) if not flash_layout else 0,
+            value_cache.stride(0) if not flash_layout else value_cache.stride(0),
+            value_cache.stride(1) if not flash_layout else value_cache.stride(2),
+            (
+                value_cache.stride(3)
+                if (not flash_layout and value_shuffle_layout)
+                else (value_cache.stride(2) if not flash_layout else value_cache.stride(3))
+            ),
+            (
+                0
+                if (not flash_layout and value_shuffle_layout)
+                else (value_cache.stride(3) if not flash_layout else value_cache.stride(1))
+            ),
+            value_cache.stride(2) if (not flash_layout and value_shuffle_layout) else 0,
+            value_cache.stride(4) if (not flash_layout and value_shuffle_layout) else 0,
+            zeros_out.stride(0) if zeros_out is not None else 0,
+            zeros_out.stride(1) if zeros_out is not None else 0,
+            zeros_out.stride(2) if zeros_out is not None else 0,
+            k_scale_ptr=k_scale,
+            v_scale_ptr=v_scale,
+            QH_PER_KH=qh // kh,
+            QH=qh,
+            KH=kh,
+            REUSE_FREQS_FRONT_PART=reuse_freqs_front_part,
+            IS_NEOX=is_neox,
+            BLOCK_D_pe=d,
+            BLOCK_D_HALF_pe=d // 2,
+            BLOCK_SIZE=block_size,
+            X_SIZE=x_cache if not flash_layout else 0,
+            FLASH_LAYOUT=flash_layout,
+            VALUE_SHUFFLE_LAYOUT=value_shuffle_layout,
+            HAVE_POS=(offs is not None),
+            HAVE_K_SCALE=(k_scale is not None and apply_scale),
+            HAVE_V_SCALE=(v_scale is not None and apply_scale),
+            HAVE_ZEROS=output_zeros,
+            num_warps=1,
+        )
 
     if zeros_out is not None:
         return q_out, k_out, key_cache, value_cache, zeros_out
