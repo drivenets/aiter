@@ -322,15 +322,10 @@ _paged_attention_kernel(const int* block_table_seq,
 
     if constexpr(KV_DTYPE != vllm::Fp8KVCacheDataType::kAuto)
     {
-        // multiply by k_scale if fp8 kv cache
-        // On gfx950, the FP8 MFMA instruction (mfma_f32_16x16x32_fp8_fp8)
-        // produces 2x the expected dot product. Apply 0.5 correction.
-#if defined(__gfx950__)
-        constexpr float FP8_MFMA_CORRECTION = 0.5f;
-#else
-        constexpr float FP8_MFMA_CORRECTION = 1.0f;
-#endif
-        scale2 *= *k_scale_ptr * FP8_MFMA_CORRECTION;
+        // FP8 storage, BF16 compute: K values in cache are K_orig / k_scale.
+        // After dequant to BF16, multiply by k_scale to recover correct scale.
+        // No 0.5 MFMA correction: we use BF16 MFMA (no 2x bug).
+        scale2 *= *k_scale_ptr;
     }
 
     const auto variant_params = [&] {
@@ -345,47 +340,10 @@ _paged_attention_kernel(const int* block_table_seq,
         }
     }();
 
-    // Pre-convert Q from BF16 to FP8 once (hoisted out of the token loop).
-    // Q values don't change across tokens, so converting inside the TLOOP
-    // wastes ~75% of the conversion cost on redundant bf16->fp8 conversions.
-    _T8x8 Q_fp8[GQA_RATIO_LOOP][HEAD_LOOP][MTP_PER_THREAD][QKHELOOP][QK_SIZE_RATIO];
-    if constexpr(KV_DTYPE != vllm::Fp8KVCacheDataType::kAuto)
-    {
-        for(int mtp = 0; mtp < mtp_loop; mtp++)
-        {
-            for(int gqa_ratio_loop = 0; gqa_ratio_loop < GQA_RATIO_LOOP; gqa_ratio_loop++)
-            {
-                for(int head_loop = 0; head_loop < HEAD_LOOP; head_loop++)
-                {
-                    for(int qkhe_depth = 0; qkhe_depth < QKHELOOP; qkhe_depth++)
-                    {
-                        for(int qkratio = 0; qkratio < QK_SIZE_RATIO; qkratio++)
-                        {
-                            for(int i = 0; i < 2; i++)
-                            {
-                                scalar_t* qptr = reinterpret_cast<scalar_t*>(
-                                    &Qlocal[gqa_ratio_loop][head_loop][mtp][qkhe_depth][qkratio]
-                                         .xy[i]);
-
-                                Q_fp8[gqa_ratio_loop][head_loop][mtp][qkhe_depth][qkratio]
-                                    .b16x4[i * 2] = __builtin_amdgcn_cvt_pk_fp8_f32(
-                                        to_float<scalar_t>(qptr[0]) * q_scale,
-                                        to_float<scalar_t>(qptr[1]) * q_scale,
-                                        0,
-                                        false);
-                                Q_fp8[gqa_ratio_loop][head_loop][mtp][qkhe_depth][qkratio]
-                                    .b16x4[i * 2 + 1] = __builtin_amdgcn_cvt_pk_fp8_f32(
-                                        to_float<scalar_t>(qptr[2]) * q_scale,
-                                        to_float<scalar_t>(qptr[3]) * q_scale,
-                                        0,
-                                        false);
-                            }
-                        }
-                    }
-                }
-            }
-        }
-    }
+    // FP8 storage, BF16 compute: Q stays as BF16, K/V dequanted in-register.
+    // Both QK and SV paths use BF16 MFMA. This preserves quality —
+    // FP8 logits or FP8 Q cause repetition on sensitive models.
+    // The cost is extra dequant ALU, but it avoids the 2x MFMA bug too.
 
     floatx4 d_out[GQA_RATIO_LOOP][MTP_PER_THREAD][TLOOP];
     // qk mfma
@@ -425,19 +383,30 @@ _paged_attention_kernel(const int* block_table_seq,
                             }
                         }
                         else
-                        { // kv cache dtype fp8 — use pre-converted Q_fp8
+                        { // kv cache dtype fp8 — dequant K to BF16, use BF16 MFMA
                             auto Ktmp       = Klocal[head_loop][token_depth][qkhe_depth];
                             _B8x16 Ktmp8x16 = *reinterpret_cast<_B8x16*>(&Ktmp);
                             for(int qkratio = 0; qkratio < QK_SIZE_RATIO; qkratio++)
                             {
-                                _T8x8 Ktmp8x8;
-                                Ktmp8x8.b8x8 = Ktmp8x16.xy[qkratio];
-
+                                _B16x8 K_bf16 = convert_b8x8_custom<scalar_t>(Ktmp8x16.xy[qkratio]);
+#if defined(__gfx950__)
                                 d_out[gqa_ratio_loop][mtp][token_depth] =
-                                    gcn_mfma16x16x32_instr<__hip_fp8_e4m3, 0, 0, 0>(
-                                        Ktmp8x8.i64,
-                                        Q_fp8[gqa_ratio_loop][head_loop][mtp][qkhe_depth][qkratio].i64,
+                                    gcn_mfma16x16x32_instr<scalar_t, 0, 0, 0>(
+                                        K_bf16,
+                                        Qlocal[gqa_ratio_loop][head_loop][mtp][qkhe_depth][qkratio],
                                         d_out[gqa_ratio_loop][mtp][token_depth]);
+#else
+                                for(int i = 0; i < 2; i++)
+                                {
+                                    d_out[gqa_ratio_loop][mtp][token_depth] =
+                                        gcn_mfma16x16x16_instr<scalar_t, 0, 0, 0>(
+                                            K_bf16.xy[i],
+                                            Qlocal[gqa_ratio_loop][head_loop][mtp][qkhe_depth]
+                                                  [qkratio]
+                                                      .xy[i],
+                                            d_out[gqa_ratio_loop][mtp][token_depth]);
+                                }
+#endif
                             }
                         }
                     }
@@ -653,8 +622,8 @@ _paged_attention_kernel(const int* block_table_seq,
     }
     else
     {
-        int rowid_8x8 = rowid / 2;
-        int offset    = rowid % 2;
+        // FP8 storage, BF16 compute: store softmax logits as BF16 (not FP8).
+        // FP8 logits cause quality degradation (repetitions) on this model.
         for(int token_depth = 0; token_depth < TLOOP; token_depth++)
         {
             for(int mtp = 0; mtp < mtp_loop; mtp++)
@@ -662,20 +631,9 @@ _paged_attention_kernel(const int* block_table_seq,
                 for(int gqa_ratio_loop = 0; gqa_ratio_loop < GQA_RATIO_LOOP; gqa_ratio_loop++)
                 {
                     d_out[gqa_ratio_loop][mtp][token_depth] *= inv_sum_scale[gqa_ratio_loop][mtp];
-                    // cast _B16x4* to _B8x8*
-                    _T8x8& logits_8x8 =
-                        *reinterpret_cast<_T8x8*>(&shared_logits[gqa_ratio_loop][0][mtp][warpid]
-                                                                [token_depth][lane16id][rowid_8x8]);
-                    logits_8x8.b16x4[offset * 2] =
-                        __builtin_amdgcn_cvt_pk_fp8_f32(d_out[gqa_ratio_loop][mtp][token_depth][0],
-                                                        d_out[gqa_ratio_loop][mtp][token_depth][1],
-                                                        0,
-                                                        false);
-                    logits_8x8.b16x4[offset * 2 + 1] =
-                        __builtin_amdgcn_cvt_pk_fp8_f32(d_out[gqa_ratio_loop][mtp][token_depth][2],
-                                                        d_out[gqa_ratio_loop][mtp][token_depth][3],
-                                                        0,
-                                                        false);
+                    shared_logits[gqa_ratio_loop][0][mtp][warpid][token_depth][lane16id]
+                                 [rowid] = from_floatx4<scalar_t>(
+                                     d_out[gqa_ratio_loop][mtp][token_depth]);
                 }
             }
         }
@@ -805,6 +763,7 @@ _paged_attention_kernel(const int* block_table_seq,
                     }
                     else
                     {
+                        // FP8 storage, BF16 compute: dequant V to BF16, use BF16 MFMA
                         for(int vfetch_depth = 0; vfetch_depth < VTLANELOOP; vfetch_depth++)
                         {
                             _B16x8 Vtmp = Vlocal[vtoken_depth][vhe_depth][vfetch_depth];
@@ -812,24 +771,37 @@ _paged_attention_kernel(const int* block_table_seq,
                             _B8x16 Vtmp8x16 = *reinterpret_cast<_B8x16*>(&Vtmp);
                             for(int j = 0; j < ELEMS16_ELEMS8_RATIO; j++)
                             {
-                                _B8x8 Vtmp8x8 = Vtmp8x16.xy[j];
-                                for(int i = 0; i < ELEMS8_ELEMS4_RATIO / 2; i++)
+                                _B16x8 V_bf16 = convert_b8x8_custom<scalar_t>(Vtmp8x16.xy[j]);
+#if defined(__gfx950__)
+                                _B16x8 tmp_in;
+                                for(int i = 0; i < ELEMS8_ELEMS4_RATIO; i++)
                                 {
                                     const int offset =
                                         rowid * ELEMS16_ELEMS8_RATIO * ELEMS8_ELEMS4_RATIO +
                                         j * ELEMS8_ELEMS4_RATIO + i;
-                                    const int offset1 = (offset % ROWS_PER_WARP) / 2;
+                                    const int offset1 = offset % ROWS_PER_WARP;
                                     const int offset2 = offset / ROWS_PER_WARP;
-                                    // output format is 16 qheads across 16 lanes, 16 head elems
-                                    // spread across 4 rows
-                                    tmp_out = gcn_mfma16x16x32_instr<__hip_fp8_e4m3, 0, 0, 0>(
-                                        reinterpret_cast<_T8x8*>(&Vtmp8x8)->i64,
-                                        reinterpret_cast<_T8x8*>(
-                                            &shared_logits[gqa_ratio_loop][0][mtp][vtoken_depth]
-                                                          [offset2][lane16id][offset1])
-                                            ->i64,
+                                    tmp_in.xy[i] =
+                                        shared_logits[gqa_ratio_loop][0][mtp][vtoken_depth][offset2]
+                                                     [lane16id][offset1];
+                                }
+                                tmp_out = gcn_mfma16x16x32_instr<scalar_t, 0, 0, 0>(
+                                    V_bf16, tmp_in, tmp_out);
+#else
+                                for(int i = 0; i < ELEMS8_ELEMS4_RATIO; i++)
+                                {
+                                    const int offset =
+                                        rowid * ELEMS16_ELEMS8_RATIO * ELEMS8_ELEMS4_RATIO +
+                                        j * ELEMS8_ELEMS4_RATIO + i;
+                                    const int offset1 = offset % ROWS_PER_WARP;
+                                    const int offset2 = offset / ROWS_PER_WARP;
+                                    tmp_out = gcn_mfma16x16x16_instr<scalar_t, 0, 0, 0>(
+                                        V_bf16.xy[i],
+                                        shared_logits[gqa_ratio_loop][0][mtp][vtoken_depth][offset2]
+                                                     [lane16id][offset1],
                                         tmp_out);
                                 }
+#endif
                             }
                         }
                     }
@@ -838,13 +810,10 @@ _paged_attention_kernel(const int* block_table_seq,
                 // apply post Softmax V mfma v_scale
                 if constexpr(KV_DTYPE != vllm::Fp8KVCacheDataType::kAuto)
                 {
-                    // On gfx950, the FP8 MFMA produces 2x the expected result;
-                    // apply same 0.5 correction as in the QK path.
-#if defined(__gfx950__)
-                    tmp_out *= *v_scale_ptr * 0.5f;
-#else
+                    // FP8 storage, BF16 compute: V values in cache are V_orig / v_scale.
+                    // After dequant to BF16, multiply by v_scale to recover correct scale.
+                    // No 0.5 MFMA correction: using BF16 MFMA (no 2x bug).
                     tmp_out *= *v_scale_ptr;
-#endif
                 }
                 outelems[gqa_ratio_loop][mtp][vhe_depth] = from_floatx4<scalar_t>(tmp_out);
             }
