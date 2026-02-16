@@ -2096,6 +2096,42 @@ void dispatchFusedAllReduceRMSNorm(hipStream_t stream,
             printf("fused allreduce rmsnorm shape size error\n");
         }
     }
+    else if(n_bytes % (sizeof(T) * packed_t<T>::P::size) == 0)
+    {
+        // Fallback for pack-aligned sizes not divisible by 1024 bytes.
+        // Handles hidden dimensions like 2880 (bf16: 5760 bytes).
+        // Uses the bounds-checked kernel variant.
+        constexpr int pack_size = packed_t<T>::P::size;
+        int n_packs = n / pack_size;
+        if(n_packs <= 512)
+        {
+            block.x             = 512;
+            int naive_grid_size = m;
+            launch_fused_allreduce_rmsnorm((local_device_load_rmsnorm<T, 512, 1>));
+        }
+        else if(n_packs <= 1024)
+        {
+            block.x             = 512;
+            int naive_grid_size = m;
+            launch_fused_allreduce_rmsnorm((local_device_load_rmsnorm<T, 512, 2>));
+        }
+        else if(n_packs <= 1536)
+        {
+            block.x             = 512;
+            int naive_grid_size = m;
+            launch_fused_allreduce_rmsnorm((local_device_load_rmsnorm<T, 512, 3>));
+        }
+        else if(n_packs <= 2048)
+        {
+            block.x             = 512;
+            int naive_grid_size = m;
+            launch_fused_allreduce_rmsnorm((local_device_load_rmsnorm<T, 512, 4>));
+        }
+        else
+        {
+            printf("fused allreduce rmsnorm: hidden dim too large (%d bytes)\n", n_bytes);
+        }
+    }
     else
     {
         printf("fused allreduce rmsnorm shape error\n");
