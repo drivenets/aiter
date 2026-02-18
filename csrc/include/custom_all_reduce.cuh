@@ -1087,6 +1087,142 @@ __global__ void __launch_bounds__(512, 1) reduce_scatter_cross_device_store(
     end_sync<ngpus, true>(sg, self_sg, rank);
 }
 
+// Single-kernel fused reduce-scatter + allgather-rmsnorm.
+// Eliminates inter-kernel launch overhead vs the 2-kernel approach.
+template <typename T, int ngpus, int tnum = 512, int n_loop = 1>
+__global__ void __launch_bounds__(tnum, 1)
+    fused_reduce_scatter_rmsnorm_single(RankData* _dp,
+                                        RankSignals sg,
+                                        Signal* self_sg,
+                                        T* __restrict__ residual_inp,
+                                        T* __restrict__ residual_out,
+                                        T* __restrict__ results,
+                                        T* __restrict__ weight,
+                                        float eps,
+                                        int rank,
+                                        int m,
+                                        int n)
+{
+    constexpr int pack_size = packed_t<T>::P::size;
+    constexpr int tnum_gpu  = tnum / ngpus;
+    using P                 = typename packed_t<T>::P;
+    using A                 = typename packed_t<T>::A;
+
+    // Shared memory: max of reduce-scatter need (tnum_gpu*ngpus*pack_size T's)
+    // and rmsnorm need (tnum floats). Former is larger.
+    __shared__ union {
+        T     rs_smem[tnum_gpu * ngpus * pack_size];
+        float rms_smem[tnum];
+    } smem;
+
+    int warp_id  = threadIdx.x / tnum_gpu;
+    int lane_id  = threadIdx.x % tnum_gpu;
+    int tid      = blockIdx.x * tnum_gpu + lane_id;
+    int size_raw = m * n;
+
+    const P* ptrs[ngpus];
+    P* tmps[ngpus];
+#pragma unroll
+    for(int i = 0; i < ngpus; ++i)
+    {
+        ptrs[i] = (const P*)_dp->ptrs[i];
+        tmps[i] = get_tmp_buf<P>(sg.signals[i]);
+    }
+
+    // --- Phase 1: reduce-scatter (identical to reduce_scatter_cross_device_store) ---
+    start_sync<ngpus>(sg, self_sg, rank);
+
+    int part = size_raw / (pack_size * ngpus);
+    for(int idx = tid; idx < part; idx += gridDim.x * tnum_gpu)
+    {
+        P input_reg                                              = ptrs[warp_id][rank * part + idx];
+        *(reinterpret_cast<P*>(&smem.rs_smem[0]) + threadIdx.x) = input_reg;
+        __syncthreads();
+        if(warp_id == 0)
+        {
+            A add_reg;
+#pragma unroll
+            for(int i = 0; i < pack_size; ++i)
+                add_reg.data[i] =
+                    ck_tile::type_convert<float>(smem.rs_smem[pack_size * threadIdx.x + i]);
+#pragma unroll
+            for(int i = 1; i < ngpus; ++i)
+            {
+#pragma unroll
+                for(int j = 0; j < pack_size; ++j)
+                    add_reg.data[j] += ck_tile::type_convert<float>(
+                        smem.rs_smem[i * pack_size * tnum_gpu + pack_size * threadIdx.x + j]);
+            }
+            P add_rslt;
+#pragma unroll
+            for(int i = 0; i < pack_size; ++i)
+                add_rslt.data[i] = ck_tile::type_convert<T>(add_reg.data[i]);
+            *(reinterpret_cast<P*>(&smem.rs_smem[0]) + lane_id) = add_rslt;
+        }
+        __syncthreads();
+        P rslt                           = *(reinterpret_cast<P*>(&smem.rs_smem[0]) + lane_id);
+        tmps[warp_id][rank * part + idx] = rslt;
+    }
+    end_sync<ngpus, true>(sg, self_sg, rank);
+
+    // --- Phase 2: local allgather + residual + RMSNorm ---
+    P* local_tmps = get_tmp_buf<P>(sg.signals[rank]);
+
+    for(int bid = blockIdx.x; bid < m; bid += gridDim.x)
+    {
+        float square_sum = 0.0f;
+        A rms_inp_f32[n_loop];
+        P w_arr[n_loop];
+#pragma unroll
+        for(int n_iter = 0; n_iter < n_loop; ++n_iter)
+        {
+            if(n_iter * tnum + threadIdx.x < (n / pack_size))
+            {
+                int read_idx        = bid * (n / pack_size) + n_iter * tnum + threadIdx.x;
+                P reduce_out_pack   = local_tmps[read_idx];
+                P residual_inp_pack = *(reinterpret_cast<P*>(residual_inp) + read_idx);
+                w_arr[n_iter]       = *(reinterpret_cast<P*>(weight) + n_iter * tnum + threadIdx.x);
+                A reduce_pack;
+#pragma unroll
+                for(int i = 0; i < pack_size; ++i)
+                {
+                    float ar_out  = ck_tile::type_convert<float>(reduce_out_pack.data[i]);
+                    float res_inp = ck_tile::type_convert<float>(residual_inp_pack.data[i]);
+                    float rms_inp = ar_out + res_inp;
+                    rms_inp_f32[n_iter].data[i] = rms_inp;
+                    reduce_pack.data[i]         = rms_inp * rms_inp;
+                }
+                square_sum += packReduce<AddFunctor, float, pack_size>(reduce_pack);
+            }
+        }
+        smem.rms_smem[threadIdx.x] = square_sum;
+        __syncthreads();
+        smemReduceSum<tnum>(&smem.rms_smem[0]);
+        square_sum  = smem.rms_smem[0];
+        float denom = rsqrtf(square_sum / n + eps);
+#pragma unroll
+        for(int n_iter = 0; n_iter < n_loop; ++n_iter)
+        {
+            if(n_iter * tnum + threadIdx.x < (n / pack_size))
+            {
+                P rmsnorm_rslt;
+                P rmsnorm_inp;
+#pragma unroll
+                for(int i = 0; i < pack_size; ++i)
+                {
+                    float x_f32          = rms_inp_f32[n_iter].data[i];
+                    float w_f32          = ck_tile::type_convert<float>(w_arr[n_iter].data[i]);
+                    rmsnorm_inp.data[i]  = ck_tile::type_convert<T>(x_f32);
+                    rmsnorm_rslt.data[i] = ck_tile::type_convert<T>(x_f32 * w_f32 * denom);
+                }
+                int write_idx = bid * (n / pack_size) + n_iter * tnum + threadIdx.x;
+                *(reinterpret_cast<P*>(results) + write_idx)      = rmsnorm_rslt;
+                *(reinterpret_cast<P*>(residual_out) + write_idx) = rmsnorm_inp;
+            }
+        }
+    }
+}
+
 template <int reduce_range>
 DINLINE void smemReduceSum(float* smem_addr)
 {
@@ -1325,6 +1461,101 @@ __global__ void __launch_bounds__(256, 1)
             *(reinterpret_cast<P*>(residual_out) + write_idx) = rmsnorm_inp;
         }
     }
+}
+
+// 1-stage fused allreduce + residual + RMSNorm kernel.
+// Reads input from all GPUs directly (allpairs), reduces, adds residual,
+// and applies RMSNorm in a single kernel launch with only 1 sync barrier.
+// For small tensors where n_packs <= tnum (e.g. hidden_size=2880, bf16: n_packs=360).
+template <typename T, int ngpus, int tnum = 512>
+__global__ void __launch_bounds__(tnum, 1)
+    cross_device_reduce_1stage_rmsnorm(RankData* _input_dp,
+                                       RankSignals sg,
+#ifdef USE_ROCM
+                                       Signal* self_sg,
+#else
+                                       volatile Signal* self_sg,
+#endif
+                                       T* __restrict__ residual_inp,
+                                       T* __restrict__ residual_out,
+                                       T* __restrict__ results,
+                                       T* __restrict__ weight,
+                                       float eps,
+                                       int rank,
+                                       int m,
+                                       int n)
+{
+    constexpr int pack_size = packed_t<T>::P::size;
+    using P                 = typename packed_t<T>::P;
+    using A                 = typename packed_t<T>::A;
+    __shared__ float smem[tnum];
+    auto dp     = *_input_dp;
+    int n_packs = n / pack_size;
+
+    start_sync<ngpus>(sg, self_sg, rank);
+
+    for(int bid = blockIdx.x; bid < m; bid += gridDim.x)
+    {
+        float square_sum = 0.0f;
+        A rms_inp_f32;
+        P w_val;
+        bool valid = (int)threadIdx.x < n_packs;
+
+        if(valid)
+        {
+            int pack_idx = bid * n_packs + threadIdx.x;
+
+            // Read from all GPUs and reduce (1-stage allpairs)
+            A sum_f32;
+#pragma unroll
+            for(int j = 0; j < pack_size; ++j)
+                sum_f32.data[j] = 0.0f;
+
+#pragma unroll
+            for(int gpu = 0; gpu < ngpus; ++gpu)
+            {
+                P val = ((const P*)dp.ptrs[gpu])[pack_idx];
+#pragma unroll
+                for(int j = 0; j < pack_size; ++j)
+                    sum_f32.data[j] += ck_tile::type_convert<float>(val.data[j]);
+            }
+
+            // Add residual
+            P res_pack = *(reinterpret_cast<const P*>(residual_inp) + pack_idx);
+#pragma unroll
+            for(int j = 0; j < pack_size; ++j)
+            {
+                float rms_inp        = sum_f32.data[j] + ck_tile::type_convert<float>(res_pack.data[j]);
+                rms_inp_f32.data[j]  = rms_inp;
+                square_sum          += rms_inp * rms_inp;
+            }
+
+            w_val = *(reinterpret_cast<const P*>(weight) + threadIdx.x);
+        }
+
+        // RMSNorm: block-level sum-of-squares reduction
+        smem[threadIdx.x] = square_sum;
+        __syncthreads();
+        smemReduceSum<tnum>(&smem[0]);
+        float denom = rsqrtf(smem[0] / n + eps);
+
+        if(valid)
+        {
+            int write_idx = bid * n_packs + threadIdx.x;
+            P rmsnorm_out, residual_out_p;
+#pragma unroll
+            for(int j = 0; j < pack_size; ++j)
+            {
+                float x   = rms_inp_f32.data[j];
+                float w   = ck_tile::type_convert<float>(w_val.data[j]);
+                rmsnorm_out.data[j]    = ck_tile::type_convert<T>(x * w * denom);
+                residual_out_p.data[j] = ck_tile::type_convert<T>(x);
+            }
+            *(reinterpret_cast<P*>(results) + write_idx)      = rmsnorm_out;
+            *(reinterpret_cast<P*>(residual_out) + write_idx) = residual_out_p;
+        }
+    }
+    end_sync<ngpus, true>(sg, self_sg, rank);
 }
 
 using IPC_KEY = std::array<uint8_t, sizeof(hipIpcMemHandle_t)>;
@@ -1762,7 +1993,7 @@ class CustomAllreduce
         }
         else if(full_nvlink_)
         {
-            if((world_size_ <= 4 && bytes < 160 * 1024) || (world_size_ <= 8 && bytes < 80 * 1024))
+            if((world_size_ <= 4 && bytes < 512 * 1024) || (world_size_ <= 8 && bytes < 1024 * 1024))
             {
                 call_1stage = true;
             }
@@ -1985,10 +2216,47 @@ void dispatchFusedAllReduceRMSNorm(hipStream_t stream,
     hipGetDeviceProperties(&dev_prop, dev);
     uint32_t num_cu = dev_prop.multiProcessorCount;
 
-    // step 1, run reduce-scatter + allgather cross device save
+    int n_packs = n / d;
+    int total_bytes = m * n * sizeof(T);
+
+    // 1-stage allpairs fused path disabled: at TP=8, it moves 4x more XGMI
+    // traffic than 2-stage reduce-scatter+allgather, causing ~9% regression
+    // at typical decode batch sizes (BS>=64). Only wins at BS<=4 where barrier
+    // overhead dominates, but that's not a practical serving scenario.
+    bool use_1stage = false;
+    if(use_1stage)
+    {
+        constexpr int tnum = 512;
+        dim3 block_1s(tnum);
+        int occupancy;
+
+#define LAUNCH_1STAGE_RMSNORM(ngpus)                                              \
+    do {                                                                           \
+        auto kptr = reinterpret_cast<const void*>(                                 \
+            cross_device_reduce_1stage_rmsnorm<T, ngpus, tnum>);                   \
+        hipOccupancyMaxActiveBlocksPerMultiprocessor(&occupancy, kptr, tnum, 0);   \
+        int grid_1s = std::min({m, (int)(num_cu * occupancy), kMaxBlocks});        \
+        cross_device_reduce_1stage_rmsnorm<T, ngpus, tnum>                         \
+            <<<grid_1s, block_1s, 0, stream>>>(                                    \
+                ptrs, sg_, self_sg_, residual_inp, residual_out, output,            \
+                weight, eps, rank_, m, n);                                          \
+    } while(0)
+
+        switch(world_size_)
+        {
+        case 8: LAUNCH_1STAGE_RMSNORM(8); break;
+        case 4: LAUNCH_1STAGE_RMSNORM(4); break;
+        case 2: LAUNCH_1STAGE_RMSNORM(2); break;
+        default: printf("fused allreduce rmsnorm 1stage: unsupported world_size\n");
+        }
+#undef LAUNCH_1STAGE_RMSNORM
+        return;
+    }
+
+    // 2-stage path: reduce-scatter + allgather+rmsnorm (two kernel launches)
     dim3 block(512);
     int block_num = ((size / world_size_) + 512 - 1) / 512;
-    dim3 grid(std::min(block_num, 80));
+    dim3 grid(std::min(block_num, kMaxBlocks));
     switch(world_size_)
     {
     case 8:
