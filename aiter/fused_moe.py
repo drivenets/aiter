@@ -1251,6 +1251,10 @@ def fused_moe_2stages(
         )
         a2 = a2.view(token_num, topk, inter_dim)
 
+    # Stage2 uses atomic_add to accumulate expert contributions into moe_out.
+    # The output must be zeroed first; torch.empty() leaves it uninitialized.
+    moe_out.zero_()
+
     metadata.stage2(
         a2,
         w1,
@@ -1727,6 +1731,9 @@ def cktile_moe_stage1(
     return out
 
 
+_DETERMINISTIC_MOE = os.environ.get("AITER_DETERMINISTIC_MOE", "0") == "1"
+
+
 def cktile_moe_stage2(
     a2,
     w1,
@@ -1750,14 +1757,13 @@ def cktile_moe_stage2(
     D = w2.shape[1]
     # max_num_tokens_padded = sorted_expert_ids.shape[0]*block_size
 
-    # out = torch.empty(
-    #     (token_num, D),
-    #     dtype=a2.dtype,
-    #     device=a2.device,
-    # )
-    # if zeros_out:
-    #     out.fill_(0)
-    # print("Run cktile_moe_stage2: M=%d, N=%d, K=%d, topk=%d, expert=%d"%(a2.shape[0]*a2.shape[1], w2.shape[1], a2.shape[2], topk, w2.shape[0]))
+    if _DETERMINISTIC_MOE:
+        return _cktile_moe_stage2_deterministic(
+            a2, w2, sorted_token_ids, sorted_expert_ids, num_valid_ids,
+            out, topk, w2_scale, a2_scale, block_m, activation,
+            sorted_weights, n_pad_zeros, k_pad_zeros, bias2,
+        )
+
     aiter.moe_cktile2stages_gemm2(
         a2,
         w2,
@@ -1775,6 +1781,64 @@ def cktile_moe_stage2(
         activation,
         block_m,
     )
+    return out
+
+
+def _cktile_moe_stage2_deterministic(
+    a2, w2, sorted_token_ids, sorted_expert_ids, num_valid_ids,
+    out, topk, w2_scale, a2_scale, block_m, activation,
+    sorted_weights, n_pad_zeros, k_pad_zeros, bias2,
+):
+    """Deterministic stage2: process each expert block sequentially.
+
+    The standard gemm2 kernel uses atomic_add to accumulate contributions from
+    multiple experts into the same output token. The order of atomic additions
+    is non-deterministic, producing different BF16 rounding each run.
+
+    This wrapper calls the same kernel once per expert group, ensuring each call
+    writes to distinct output locations (no atomic_add contention).
+    """
+    total_valid = num_valid_ids[0].item()
+    num_blocks = sorted_expert_ids.shape[0]
+    max_entry = sorted_token_ids.shape[0]
+    device = out.device
+
+    block_idx = 0
+    while block_idx < num_blocks:
+        start_entry = block_idx * block_m
+        if start_entry >= total_valid:
+            break
+
+        cur_expert = sorted_expert_ids[block_idx].item()
+        end_block = block_idx + 1
+        while end_block < num_blocks and sorted_expert_ids[end_block].item() == cur_expert:
+            end_block += 1
+
+        end_entry = min(end_block * block_m, max_entry)
+        n_entries = end_entry - start_entry
+        n_valid = min(end_entry, total_valid) - start_entry
+        if n_valid <= 0:
+            block_idx = end_block
+            continue
+
+        sub_sorted_ids = sorted_token_ids[start_entry:end_entry].contiguous()
+        sub_expert_ids = sorted_expert_ids[block_idx:end_block].contiguous()
+        sub_weights = (
+            sorted_weights[start_entry:end_entry].contiguous()
+            if sorted_weights is not None else None
+        )
+        sub_num_valid = torch.tensor([n_valid, num_valid_ids[1].item()],
+                                     dtype=dtypes.i32, device=device)
+
+        aiter.moe_cktile2stages_gemm2(
+            a2, w2, out,
+            sub_sorted_ids, sub_expert_ids, sub_num_valid,
+            topk, n_pad_zeros, k_pad_zeros, sub_weights,
+            a2_scale, w2_scale, bias2, activation, block_m,
+        )
+
+        block_idx = end_block
+
     return out
 
 
