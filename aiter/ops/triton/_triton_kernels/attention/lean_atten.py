@@ -377,6 +377,7 @@ def la_persistent(
                 gqa_group_size=gqa_group_size,
                 use_64_indexing=use_64_indexing,
                 RAGGED_BATCH=RAGGED_BATCH,
+                is_pod=is_pod,
             )
 
 
@@ -430,6 +431,7 @@ def la_persistent_inner(
     gqa_group_size: tl.constexpr,
     use_64_indexing: tl.constexpr,
     RAGGED_BATCH: tl.constexpr,
+    is_pod: tl.constexpr = False,
 ):
 
     tl.assume(stride_qm > 0)  # n_ctx_q
@@ -685,11 +687,14 @@ def la_persistent_inner(
         tl.store(mp_ptrs, m_i, cache_modifier=".wt")
         tl.store(lp_ptrs, l_i, cache_modifier=".wt")
         tl.store(op_ptrs, acc, cache_modifier=".wt")
-        tl.debug_barrier()
-        tl.store(locks + current_pid, 1, cache_modifier=".wt")
-        # According to streamK gemm, store + cache_modifier won't work universally
-        # atomic_xchg is better solution but a less performant variant
-        # tl.atomic_xchg(locks + current_pid, 1)
+        if is_pod:
+            # POD shares the cooperative grid between decode and prefill, so
+            # tl.debug_barrier() (device-wide) would deadlock.  Use an atomic
+            # release instead — the host CTA already reads with .cv/.atomic.
+            tl.atomic_xchg(locks + current_pid, 1)
+        else:
+            tl.debug_barrier()
+            tl.store(locks + current_pid, 1, cache_modifier=".wt")
 
     if host_block:  # and finishing_block:
         # A host block that is also a finishing block completes all the LeanTile iterations for its output tile
