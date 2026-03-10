@@ -904,9 +904,18 @@ def get_2stage_cfgs(
     )
 
     def get_block_m() -> int:
+        _w32 = os.environ.get("AITER_MOE_WARP32", "0")
+        use_warp32 = _w32 != "0"
         if q_dtype_a == dtypes.fp8:
-            return 32
+            # warp32 kernel (MPerBlock=64) requires block_m >= 64
+            return 64 if use_warp32 else 32
         else:
+            if use_warp32:
+                # 32x32 MFMA kernel uses MPerBlock=64; block_m must match
+                if token < 65536:
+                    return 64
+                else:
+                    return 128
             if token < 2048:
                 return 16
             elif token < 16384:
@@ -978,7 +987,7 @@ def get_2stage_cfgs(
                 k_pad_zeros=intermediate_pad // 128 * 128,
                 activation=activation,
             ),
-            16 if token < 2048 else 32 if token < 16384 else 64,
+            get_block_m(),
             ksplit,
             run_1stage,
         )

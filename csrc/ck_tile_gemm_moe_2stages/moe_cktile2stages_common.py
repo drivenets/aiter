@@ -169,6 +169,12 @@ a16w4_gemm1_kernels_list_gfx950= {
     # === block_m=64, 128 (existing) ===
     3: kernelInstance(       1,        256,       64,        256,       256,           16,         16,          32,          1,           4,          1,),
     4: kernelInstance(       1,        256,      128,        256,       256,           16,         16,          32,          1,           4,          1,),
+    # === 32x32 warp tile variants (K alignment = 128 instead of 256) ===
+    # WAVE_TILE 32x32x16 (bf16 mfma_f32_32x32x16), WAVE_MAP_M=1, WAVE_MAP_N=4
+    # NPerBlock=256 required: NIterPerWarp=256/(4*32)=2, must be multiple of XDL_PerScaleN=2
+    # MPerBlock >= 32 required (MPerXdl*MWave=32*1=32)
+   51: kernelInstance(       1,        256,       32,        256,       128,           32,         32,          16,          1,           4,          2,),\
+   53: kernelInstance(       1,        256,       64,        256,       128,           32,         32,          16,          1,           4,          1,),
 }
 # gemm1 out:bf16/fp16 AB:bf16/fp4
 a16w4_gemm1_kernels_list= {
@@ -208,6 +214,10 @@ a16w4_gemm2_kernels_list_gfx950= {
     # === block_m=64, 128 (existing) ===
     3: kernelInstance(       2,        256,       64,        256,       256,           16,         16,          32,          1,        4,            1,),
     4: kernelInstance(       2,        256,      128,        256,       256,           16,         16,          32,          1,        4,            1,),
+    # === 32x32 warp tile variants (K alignment = 128 instead of 256) ===
+    # NPerBlock=256, KPerBlock=128, WAVE_TILE 32x32x16
+   51: kernelInstance(       2,        256,       32,        256,       128,           32,         32,          16,          1,        4,            2,),\
+   53: kernelInstance(       2,        256,       64,        256,       128,           32,         32,          16,          1,        4,            1,),
 }
 
 # gemm1 out:bf16/fp16 AB:fp8/fp4
@@ -336,6 +346,16 @@ struct moe_gemm1_heuristic_dispatcher<{(a_data_type)}, {(b_data_type)}, {(acc_da
     {{
         const char* _var = std::getenv("AITER_MOE_G1_VARIANT");
         int variant = _var ? std::atoi(_var) : 0;
+        const char* _w32 = std::getenv("AITER_MOE_WARP32");
+        bool use_warp32 = _w32 && std::atoi(_w32) != 0;
+
+        // 32x32 warp tile variants (K alignment = 128 instead of 256)
+        // Always use MPerBlock=64 (ID 53): MXdlPack=2 requires MIterPerWarp>=2,
+        // but MPerBlock=32 with WG::kM=32 gives MIterPerWarp=1 → zero MFMA iterations
+        if (use_warp32)
+        {{
+            return {(1, 53)}<{(a_data_type)}, {(b_data_type)}, {(acc_data_type)}, {(c_data_type)}>;
+        }}
 
         if (block_m == 16)
         {{
@@ -388,6 +408,16 @@ struct moe_gemm2_heuristic_dispatcher<{(a_data_type)}, {(b_data_type)}, {(acc_da
     {{
         const char* _var = std::getenv("AITER_MOE_G2_VARIANT");
         int variant = _var ? std::atoi(_var) : 0;
+        const char* _w32 = std::getenv("AITER_MOE_WARP32");
+        bool use_warp32 = _w32 && std::atoi(_w32) != 0;
+
+        // 32x32 warp tile variants (K alignment = 128 instead of 256)
+        // Always use MPerBlock=64 (ID 53): MXdlPack=2 requires MIterPerWarp>=2,
+        // but MPerBlock=32 with WG::kM=32 gives MIterPerWarp=1 → zero MFMA iterations
+        if (use_warp32)
+        {{
+            return {(2, 53)}<{(a_data_type)}, {(b_data_type)}, {(acc_data_type)}, {(c_data_type)}>;
+        }}
 
         if (block_m == 16)
         {{

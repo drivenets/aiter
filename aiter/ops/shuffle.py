@@ -82,15 +82,15 @@ def shuffle_weight_a16w4(src: torch.Tensor, NLane: int, gate_up: bool) -> torch.
 
 
 def shuffle_scale_a16w4(
-    src: torch.Tensor, experts_cnt: int, gate_up: bool
+    src: torch.Tensor, experts_cnt: int, gate_up: bool, n_lane: int = 16
 ) -> torch.Tensor:
     n_experts, k_ = src.shape
     n_ = n_experts // experts_cnt
     # MXFP4 constants
     K_Pack = 2
     N_Pack = 2
-    N_Lane = 16
-    K_Lane = 64 // N_Lane  # 4
+    N_Lane = n_lane
+    K_Lane = 64 // N_Lane  # 4 for 16x16, 2 for 32x32
 
     # Basic dimensions
     K1 = k_ // K_Pack // K_Lane  # k_ // 8
