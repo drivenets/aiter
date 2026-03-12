@@ -170,11 +170,16 @@ a16w4_gemm1_kernels_list_gfx950= {
     3: kernelInstance(       1,        256,       64,        256,       256,           16,         16,          32,          1,           4,          1,),
     4: kernelInstance(       1,        256,      128,        256,       256,           16,         16,          32,          1,           4,          1,),
     # === 32x32 warp tile variants (K alignment = 128 instead of 256) ===
-    # WAVE_TILE 32x32x16 (bf16 mfma_f32_32x32x16), WAVE_MAP_M=1, WAVE_MAP_N=4
-    # NPerBlock=256 required: NIterPerWarp=256/(4*32)=2, must be multiple of XDL_PerScaleN=2
+    # WAVE_TILE 32x32x16 (bf16 mfma_f32_32x32x16)
     # MPerBlock >= 32 required (MPerXdl*MWave=32*1=32)
+    # --- NWarp=4 (BLOCK_SIZE=256): scheduling formulas produce Bload_num_perK=0, dswrite_num_perK=0
    51: kernelInstance(       1,        256,       32,        256,       128,           32,         32,          16,          1,           4,          2,),\
    53: kernelInstance(       1,        256,       64,        256,       128,           32,         32,          16,          1,           4,          1,),
+    # --- NWarp=2 (BLOCK_SIZE=128): scheduling formulas produce non-zero overlap values
+    # NIterPerWarp=256/(2*32)=4, Bload_num_perK=1, dswrite_num_perK=1
+   55: kernelInstance(       1,        128,       64,        256,       128,           32,         32,          16,          1,           2,          1,),
+    # --- NWarp=2, MPerBlock=32: for decode (small M) with reduced padding (inter=384 vs 512)
+   56: kernelInstance(       1,        128,       32,        256,       128,           32,         32,          16,          1,           2,          1,),
 }
 # gemm1 out:bf16/fp16 AB:bf16/fp4
 a16w4_gemm1_kernels_list= {
@@ -215,9 +220,14 @@ a16w4_gemm2_kernels_list_gfx950= {
     3: kernelInstance(       2,        256,       64,        256,       256,           16,         16,          32,          1,        4,            1,),
     4: kernelInstance(       2,        256,      128,        256,       256,           16,         16,          32,          1,        4,            1,),
     # === 32x32 warp tile variants (K alignment = 128 instead of 256) ===
-    # NPerBlock=256, KPerBlock=128, WAVE_TILE 32x32x16
+    # WAVE_TILE 32x32x16
+    # --- NWarp=4 (BLOCK_SIZE=256): scheduling has zero overlap values
    51: kernelInstance(       2,        256,       32,        256,       128,           32,         32,          16,          1,        4,            2,),\
    53: kernelInstance(       2,        256,       64,        256,       128,           32,         32,          16,          1,        4,            1,),
+    # --- NWarp=2 (BLOCK_SIZE=128): scheduling has proper overlap (Bload=1, dswrite=1)
+   55: kernelInstance(       2,        128,       64,        256,       128,           32,         32,          16,          1,        2,            1,),
+    # --- NWarp=2, MPerBlock=32: for decode (small M) with reduced padding (inter=384 vs 512)
+   56: kernelInstance(       2,        128,       32,        256,       128,           32,         32,          16,          1,        2,            1,),
 }
 
 # gemm1 out:bf16/fp16 AB:fp8/fp4
@@ -230,6 +240,9 @@ a8w4_gemm1_kernels_list_gfx950= {
     # 4: kernelInstance(       2,        256,      128,        256,       128,           16,         16,          32,          1,        4,            1,),
     # 4: kernelInstance(       2,        256,      256,        256,       256,           16,         16,          32,          1,        4,),
     # 4: kernelInstance(       2,        256,      256,        128,       128,           16,         16,          32,          1,        4,),
+    # === 32x32 warp tile with fp8 activation (mfma_scale_f32_32x32x64_f8f6f4) ===
+    # K alignment = 128 (vs 256 for 16x16), NWarp=4, MIterPerWarp=2, KIterPerWarp=2
+   55: kernelInstance(       1,        256,       64,        256,       128,           32,         32,          64,          1,        4,            1,),
 }
 # gemm2 out:bf16/fp16 AB:fp8/fp4
 a8w4_gemm2_kernels_list_gfx950= {
@@ -241,6 +254,8 @@ a8w4_gemm2_kernels_list_gfx950= {
     # 4: kernelInstance(       2,        256,      128,        256,       128,           16,         16,          32,          1,        4,            1,),
     # 4: kernelInstance(       2,        256,      256,        256,       256,           16,         16,          32,          1,        4,),
     # 4: kernelInstance(       2,        256,      256,        128,       128,           16,         16,          32,          1,        4,),
+    # === 32x32 warp tile with fp8 activation (mfma_scale_f32_32x32x64_f8f6f4) ===
+   55: kernelInstance(       2,        256,       64,        256,       128,           32,         32,          64,          1,        4,            1,),
 }
 
 # fmt: on
@@ -349,12 +364,12 @@ struct moe_gemm1_heuristic_dispatcher<{(a_data_type)}, {(b_data_type)}, {(acc_da
         const char* _w32 = std::getenv("AITER_MOE_WARP32");
         bool use_warp32 = _w32 && std::atoi(_w32) != 0;
 
-        // 32x32 warp tile variants (K alignment = 128 instead of 256)
-        // Always use MPerBlock=64 (ID 53): MXdlPack=2 requires MIterPerWarp>=2,
-        // but MPerBlock=32 with WG::kM=32 gives MIterPerWarp=1 → zero MFMA iterations
+        // 32x32 warp tile: NWarp=2 (ID 55) for proper pipeline scheduling overlap
+        // 39% faster at prefill (32K tokens), ~75% slower at decode (1-7 tokens)
+        // Weight layout (n_lane=32, inter alignment=128) differs from 16x16 → cannot mix at runtime
         if (use_warp32)
         {{
-            return {(1, 53)}<{(a_data_type)}, {(b_data_type)}, {(acc_data_type)}, {(c_data_type)}>;
+            return {(1, 55)}<{(a_data_type)}, {(b_data_type)}, {(acc_data_type)}, {(c_data_type)}>;
         }}
 
         if (block_m == 16)
@@ -411,12 +426,10 @@ struct moe_gemm2_heuristic_dispatcher<{(a_data_type)}, {(b_data_type)}, {(acc_da
         const char* _w32 = std::getenv("AITER_MOE_WARP32");
         bool use_warp32 = _w32 && std::atoi(_w32) != 0;
 
-        // 32x32 warp tile variants (K alignment = 128 instead of 256)
-        // Always use MPerBlock=64 (ID 53): MXdlPack=2 requires MIterPerWarp>=2,
-        // but MPerBlock=32 with WG::kM=32 gives MIterPerWarp=1 → zero MFMA iterations
+        // 32x32 warp tile: NWarp=2 (ID 55) for proper pipeline scheduling overlap
         if (use_warp32)
         {{
-            return {(2, 53)}<{(a_data_type)}, {(b_data_type)}, {(acc_data_type)}, {(c_data_type)}>;
+            return {(2, 55)}<{(a_data_type)}, {(b_data_type)}, {(acc_data_type)}, {(c_data_type)}>;
         }}
 
         if (block_m == 16)
@@ -532,12 +545,23 @@ a8w4_gfx950_heuristic_dispatch = """#pragma once
 // Copyright (C) 2024-2025, Advanced Micro Devices, Inc. All rights reserved.
 #include "moe_cktile2stages.h"
 #include "moe_cktile2stages_heuristic_dispatch_common.h"
+#include <cstdlib>
 
 template <>
 struct moe_gemm1_heuristic_dispatcher<{(a_data_type)}, {(b_data_type)}, {(acc_data_type)}, {(c_data_type)}, {(activation)}, {(has_bias)}, {(split_k)}>
 {{
     static MoeKernel dispatch(int M, int N, int K, int block_m)
     {{
+        const char* _w32 = std::getenv("AITER_MOE_WARP32");
+        bool use_warp32 = _w32 && std::atoi(_w32) != 0;
+
+        // 32x32 warp tile with fp8 activation: mfma_scale_f32_32x32x64_f8f6f4
+        // K alignment = 128 (vs 256 for 16x16), reduces inter padding from 42% to 6.7%
+        if (use_warp32)
+        {{
+            return {(1, 55)}<{(a_data_type)}, {(b_data_type)}, {(acc_data_type)}, {(c_data_type)}>;
+        }}
+
         // Apply shape heuristics to find a suitable kernel implementation.
         if (block_m == 32)
         {{
@@ -562,6 +586,15 @@ struct moe_gemm2_heuristic_dispatcher<{(a_data_type)}, {(b_data_type)}, {(acc_da
 {{
     static MoeKernel dispatch(int M, int N, int K, int block_m)
     {{
+        const char* _w32 = std::getenv("AITER_MOE_WARP32");
+        bool use_warp32 = _w32 && std::atoi(_w32) != 0;
+
+        // 32x32 warp tile with fp8 activation
+        if (use_warp32)
+        {{
+            return {(2, 55)}<{(a_data_type)}, {(b_data_type)}, {(acc_data_type)}, {(c_data_type)}>;
+        }}
+
         // Apply shape heuristics to find a suitable kernel implementation.
         if (block_m == 32)
         {{

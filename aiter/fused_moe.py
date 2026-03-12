@@ -470,12 +470,14 @@ def fused_moe_1stage(
         token_num = hidden_states.shape[0]
         E, model_dim, inter_dim = get_inter_dim(w1.shape, w2.shape)
         if quant_type == QuantType.per_1x32:
+            _n_lane = 32 if os.environ.get("AITER_MOE_WARP32", "0") != "0" else 16
             a1_scale = fp4_utils.moe_mxfp4_sort(
                 a1_scale,
                 sorted_ids,
                 num_valid_ids,
                 token_num,
                 block_size_M,
+                n_lane=_n_lane,
             )
             w1_scale = w1_scale.view(E, -1)
             w2_scale = w2_scale.view(E, -1)
@@ -1146,6 +1148,7 @@ def fused_moe_2stages(
                 token_num=token_num,
                 topk=1,
                 block_size=block_size_M,
+                n_lane=_n_lane,
             )
         else:
             a1, a1_scale = quant_func(
@@ -1160,6 +1163,7 @@ def fused_moe_2stages(
                 num_valid_ids=num_valid_ids,
                 token_num=token_num,
                 block_size=block_size_M,
+                n_lane=_n_lane,
             )
     elif hidden_states.dtype != q_dtype_a:
         if quant_type == QuantType.per_1x128 and metadata.stage1.func is asm_stage1:
@@ -1238,6 +1242,7 @@ def fused_moe_2stages(
         a2_scale = a1_scale
     elif quant_type == QuantType.per_1x32:
         a2 = a2.view(-1, inter_dim)
+        _n_lane = 32 if os.environ.get("AITER_MOE_WARP32", "0") != "0" else 16
         if token_num <= token_num_quant_moe_sort_switch:
             a2, a2_scale = fused_dynamic_mxfp4_quant_moe_sort(
                 a2,
@@ -1246,6 +1251,7 @@ def fused_moe_2stages(
                 token_num=token_num,
                 topk=topk,
                 block_size=block_size_M,
+                n_lane=_n_lane,
             )
         else:
             a2, a2_scale = quant_func(
@@ -1261,6 +1267,7 @@ def fused_moe_2stages(
                 num_valid_ids=num_valid_ids,
                 token_num=token_num,
                 block_size=block_size_M,
+                n_lane=_n_lane,
             )
         a2 = a2.view(token_num, topk, -1)
     elif quant_type == QuantType.per_1x128 and metadata.stage1.func is asm_stage1:

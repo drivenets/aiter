@@ -516,6 +516,7 @@ def moe_mxfp4_sort(
     num_valid_ids: torch.Tensor,
     token_num: int,
     block_size: int = 32,
+    n_lane: int = 16,
 ) -> torch.Tensor:
     """
     Sort the blockscale_e8m0 tensor based on the sorted_ids tensor.
@@ -523,13 +524,20 @@ def moe_mxfp4_sort(
     Args:
         blockscale_e8m0: The input tensor to be sorted.
         sorted_ids: The indices used for sorting.
+        n_lane: MFMA tile lane width. 16 for 16x16, 32 for 32x32.
+            Controls int32 packing layout to match CK kernel's scale descriptor:
+            (MThreadPerXdl=n_lane, KThreadPerXdl=64/n_lane).
 
     Returns:
         A sorted tensor.
     """
-    # This is fixed by spec for MXFP4. Do not tune this.
-    BLOCK_SIZE_M, BLOCK_SIZE_N = 32, 8
-    BLOCK_SIZE_M_u32, BLOCK_SIZE_N_u32 = 16, 4
+    # MThreadPerXdl = n_lane, KThreadPerXdl = 64 / n_lane
+    # MXFP4M_Pack = 2, MXFP4K_Pack = 2 (from CK kernel)
+    # Outer block = inner * Pack factor
+    BLOCK_SIZE_M_u32 = n_lane          # MThreadPerXdl
+    BLOCK_SIZE_N_u32 = 64 // n_lane    # KThreadPerXdl
+    BLOCK_SIZE_M = BLOCK_SIZE_M_u32 * 2  # * MXFP4M_Pack
+    BLOCK_SIZE_N = BLOCK_SIZE_N_u32 * 2  # * MXFP4K_Pack
 
     # Assume blockscale_e8m0 is 2D-Tensor for now
     topk = 1
