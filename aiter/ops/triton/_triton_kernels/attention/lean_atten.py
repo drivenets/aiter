@@ -46,6 +46,8 @@ def _get_config():
 
 @triton.jit
 def find_group_sequential(x, MASKED_BLOCKS: tl.constexpr, num_m_blocks: tl.constexpr):
+    # num_m_blocks MUST be power of 2 (Triton on ROCm constraint).
+    # Callers must pad to next_power_of_2 and set num_m_blocks_actual separately.
     i = tl.arange(0, num_m_blocks)
     q_block_idx = i  # Group indices: 0, 1, 2, ...
 
@@ -71,6 +73,7 @@ def find_group_sequential(x, MASKED_BLOCKS: tl.constexpr, num_m_blocks: tl.const
 
 @triton.jit
 def find_group_pingpong(x, MASKED_BLOCKS: tl.constexpr, num_m_blocks: tl.constexpr):
+    # num_m_blocks MUST be power of 2 (Triton on ROCm constraint).
     i = tl.arange(0, num_m_blocks)
     pair_idx = i // 2
     q_block_idx = tl.where(i % 2 == 0, pair_idx, num_m_blocks - 1 - pair_idx)

@@ -1,4 +1,5 @@
 import logging
+import math
 
 import torch
 import triton
@@ -8,6 +9,13 @@ from aiter.ops.triton._triton_kernels.attention.pod_attention import (
 )
 
 logger = logging.getLogger(__name__)
+
+
+def _next_power_of_2(n):
+    """Round up to next power of 2 (returns n if already power of 2)."""
+    if n <= 0:
+        return 1
+    return 1 << (n - 1).bit_length()
 
 
 def pod_attention(
@@ -138,8 +146,31 @@ def pod_attention(
     o = o_padded[:N_CTX_Q * batch_size]
 
     # Calculate Prefill Params
-    N_CTX_Q_pf = q_pf.shape[0] // batch_size_pf
-    N_CTX_K_pf = k_pf.shape[0]  # This is the sum of all ctx_n in a batch
+    N_CTX_Q_pf_orig = q_pf.shape[0] // batch_size_pf
+    # Pad N_CTX_Q_pf so num_m_blocks_pf is power of 2
+    # (Triton on ROCm requires power-of-2 arange sizes in find_group_*)
+    num_m_blocks_pf_raw = (N_CTX_Q_pf_orig + BLOCK_M_pf - 1) // BLOCK_M_pf
+    num_m_blocks_pf_po2 = _next_power_of_2(num_m_blocks_pf_raw)
+    N_CTX_Q_pf = num_m_blocks_pf_po2 * BLOCK_M_pf
+    # Pad Q_pf if needed
+    needed_pf_rows = N_CTX_Q_pf * batch_size_pf
+    if q_pf.shape[0] < needed_pf_rows:
+        q_pf_padded = torch.zeros(needed_pf_rows, q_pf.shape[1], q_pf.shape[2],
+                                   dtype=q_pf.dtype, device=q_pf.device)
+        q_pf_padded[:q_pf.shape[0]] = q_pf
+        q_pf = q_pf_padded
+    # K/V for prefill are contiguous dense tensors — pad them too
+    if k_pf.shape[0] < needed_pf_rows:
+        k_pf_padded = torch.zeros(needed_pf_rows, k_pf.shape[1], k_pf.shape[2],
+                                   dtype=k_pf.dtype, device=k_pf.device)
+        k_pf_padded[:k_pf.shape[0]] = k_pf
+        k_pf = k_pf_padded
+        v_pf_padded = torch.zeros(needed_pf_rows, v_pf.shape[1], v_pf.shape[2],
+                                   dtype=v_pf.dtype, device=v_pf.device)
+        v_pf_padded[:v_pf.shape[0]] = v_pf
+        v_pf = v_pf_padded
+
+    N_CTX_K_pf = k_pf.shape[0]  # Updated after padding
     H_K_pf = k_pf.shape[1]  # GQA: may differ from H
 
     # MASKED_BLOCKS is used for prefill/causal for BLOCK_M > BLOCK_N
@@ -179,13 +210,9 @@ def pod_attention(
 
     grid = (total_programs, 1, 1)
 
-    # Same padding for prefill Q and output
-    padded_rows_pf = max(q_pf.shape[0], BLOCK_M_pf * batch_size_pf)
-    if q_pf.shape[0] < padded_rows_pf:
-        q_pf_padded = torch.zeros(padded_rows_pf, H, HEAD_DIM_K, dtype=q_pf.dtype, device=q_pf.device)
-        q_pf_padded[:q_pf.shape[0]] = q_pf
-        q_pf = q_pf_padded
-    o_pf_padded = torch.empty(padded_rows_pf, H, HEAD_DIM_K, dtype=v_pf.dtype, device=q_pf.device)
+    # Allocate padded output for prefill (matches q_pf which was already po2-padded above)
+    o_pf_padded = torch.empty(q_pf.shape[0], H, HEAD_DIM_K, dtype=v_pf.dtype, device=q_pf.device)
+    # Slice to padded size for kernel; will slice to original size before returning
     o_pf = o_pf_padded[:N_CTX_Q_pf * batch_size_pf]
 
     # TODO: need to tune
@@ -198,6 +225,23 @@ def pod_attention(
         HEAD_DIM_PADDED = 16
     MASKED_BLOCKS_DEC = BLOCK_M // BLOCK_N
 
+    # Debug: log all constexpr values
+    logger.info(
+        "POD constexprs: HEAD_DIM=%d HEAD_DIM_ORIG=%d BLOCK_M=%d BLOCK_N=%d "
+        "MASKED_BLOCKS_DEC=%d batch_size=%d num_m_blocks=%d num_n_blocks=%d "
+        "high_load_wgs=%d max_tiles_per_wg=%d tiles_per_head=%d num_splits=%d "
+        "BLOCK_M_pf=%d BLOCK_N_pf=%d MASKED_BLOCKS=%d batch_size_pf=%d "
+        "num_m_blocks_pf=%d num_n_blocks_pf=%d high_load_wgs_pf=%d "
+        "max_tiles_per_wg_pf=%d tiles_per_head_pf=%d num_splits_pf=%d "
+        "max_output_tile_cnt=%d gqa_group_size=%d total_programs_half=%d",
+        HEAD_DIM_PADDED, HEAD_DIM_K, BLOCK_M, BLOCK_N,
+        MASKED_BLOCKS_DEC, batch_size, num_m_blocks, num_n_blocks,
+        high_load_wgs, max_tiles_per_wg, tiles_per_head, num_splits,
+        BLOCK_M_pf, BLOCK_N_pf, MASKED_BLOCKS, batch_size_pf,
+        num_m_blocks_pf, num_n_blocks_pf, high_load_wgs_pf,
+        max_tiles_per_wg_pf, tiles_per_head_pf, num_splits_pf,
+        max_output_tile_cnt, gqa_group_size, total_wgs,
+    )
     pod_kernel = pod_persistent[grid](
         cu_ctr,
         # Decode positional arguments
@@ -257,7 +301,9 @@ def pod_attention(
         pod_kernel.n_regs, pod_kernel.n_spills,
     )
 
-    return o, o_pf
+    # Slice o_pf back to original (unpadded) prefill token count
+    o_pf_out = o_pf[:N_CTX_Q_pf_orig * batch_size_pf]
+    return o, o_pf_out
 
 
 def get_num_splits_and_buffer_sizes(

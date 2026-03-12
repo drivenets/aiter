@@ -566,6 +566,7 @@ def fused_dynamic_mxfp4_quant_moe_sort(
     topk: int,
     block_size: int = 32,
     scaling_mode: str = "even",
+    n_lane: int = 16,
 ):
     """
     Fusing dynamic_mxfp4_quant and moe_mxfp4_sort
@@ -600,8 +601,10 @@ def fused_dynamic_mxfp4_quant_moe_sort(
 
     BLOCK_SIZE_Mx = 128
 
-    BLOCK_SIZE_M, BLOCK_SIZE_N = 32, 8
-    BLOCK_SIZE_M_u32, BLOCK_SIZE_N_u32 = 16, 4
+    BLOCK_SIZE_M_u32 = n_lane          # MThreadPerXdl
+    BLOCK_SIZE_N_u32 = 64 // n_lane    # KThreadPerXdl
+    BLOCK_SIZE_M = BLOCK_SIZE_M_u32 * 2  # * MXFP4M_Pack
+    BLOCK_SIZE_N = BLOCK_SIZE_N_u32 * 2  # * MXFP4K_Pack
 
     M_i, N_i = M, scaleN
     M_o, N_o = sorted_ids.shape[0], N_i
