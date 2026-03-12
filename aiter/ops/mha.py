@@ -2836,7 +2836,9 @@ def _mha_batch_prefill(
         q_descale,
         k_descale,
         v_descale,
-        kv_block_descale,
+        # NOTE: kv_block_descale is accepted by the Python wrapper but NOT by the
+        # C++ op (mha_batch_prefill_pybind).  Passing it here shifts all subsequent
+        # positional args and causes sink_ptr to land in the gen slot.
         kv_last_page_lens,
         block_table,
         seqlen_k,
