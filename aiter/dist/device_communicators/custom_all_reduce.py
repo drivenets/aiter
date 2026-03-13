@@ -49,6 +49,18 @@ class CustomAllreduce:
 
     _SUPPORTED_WORLD_SIZES = [2, 4, 6, 8]
 
+    @staticmethod
+    def _is_piecewise_cuda_graph() -> bool:
+        """Check if we are inside a piecewise CUDA graph split op execution."""
+        try:
+            from sglang.srt.compilation.piecewise_context_manager import (
+                is_in_piecewise_cuda_graph,
+            )
+
+            return is_in_piecewise_cuda_graph()
+        except ImportError:
+            return False
+
     # max_size: max supported allreduce size
     def __init__(
         self,
@@ -485,7 +497,20 @@ class CustomAllreduce:
                     use_1stage=use_1stage,
                 )
             else:
-                return torch.zeros_like(input), torch.zeros_like(input)
+                # Could be warmup OR piecewise cuda graph split op execution.
+                # In piecewise cuda graph, split ops run eagerly outside the
+                # graph but _IS_CAPTURING is still True.
+                if self._is_piecewise_cuda_graph():
+                    return self.fused_ar_rms(
+                        input,
+                        residual_inp,
+                        w=weight,
+                        eps=eps,
+                        registered=False,
+                        use_1stage=use_1stage,
+                    )
+                else:
+                    return torch.zeros_like(input), torch.zeros_like(input)
         else:
             return self.fused_ar_rms(
                 input,
@@ -519,11 +544,22 @@ class CustomAllreduce:
                     post_per_token_quant=True,
                 )
             else:
-                dummy_out = torch.zeros(input.shape, dtype=fp8, device=input.device)
-                dummy_scale_out = torch.zeros(
-                    input.shape[:-1] + (1,), dtype=torch.float32, device=input.device
-                )
-                return dummy_out, torch.zeros_like(input), dummy_scale_out
+                if self._is_piecewise_cuda_graph():
+                    return self.fused_ar_rms(
+                        input,
+                        residual_inp,
+                        w=weight,
+                        eps=eps,
+                        registered=False,
+                        use_1stage=use_1stage,
+                        post_per_token_quant=True,
+                    )
+                else:
+                    dummy_out = torch.zeros(input.shape, dtype=fp8, device=input.device)
+                    dummy_scale_out = torch.zeros(
+                        input.shape[:-1] + (1,), dtype=torch.float32, device=input.device
+                    )
+                    return dummy_out, torch.zeros_like(input), dummy_scale_out
         else:
             return self.fused_ar_rms(
                 input,
