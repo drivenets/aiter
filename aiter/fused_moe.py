@@ -435,14 +435,28 @@ def fused_moe_1stage(
     else:
         quant_func = get_quant(quant_type)
         if hidden_states.dtype != q_dtype_a:
+            # Check for pre-computed FP8+scales from fused AR+RMS+quant
+            _cached_moe = None
             if quant_type == QuantType.per_1x128:
-                quant_func = functools.partial(quant_func, transpose_scale=True)
-            a1, a1_scale = quant_func(
-                hidden_states,
-                scale=a1_scale,
-                quant_dtype=q_dtype_a,
-                num_rows=num_local_tokens,
-            )
+                try:
+                    from sglang.srt.layers.quantization.fp8_pgquant_cache import fetch
+                    _cached_moe = fetch(hidden_states)
+                except Exception:
+                    pass
+            if _cached_moe is not None:
+                a1, a1_scale = _cached_moe
+                if quant_type == QuantType.per_1x128:
+                    # Cache scales have shape [M, K/128], need transposed [K/128, M] for MoE
+                    a1_scale = a1_scale.T.contiguous()
+            else:
+                if quant_type == QuantType.per_1x128:
+                    quant_func = functools.partial(quant_func, transpose_scale=True)
+                a1, a1_scale = quant_func(
+                    hidden_states,
+                    scale=a1_scale,
+                    quant_dtype=q_dtype_a,
+                    num_rows=num_local_tokens,
+                )
         else:
             assert (
                 a1_scale is not None or quant_type == QuantType.No
