@@ -571,6 +571,66 @@ class CustomAllreduce:
                 post_per_token_quant=True,
             )
 
+    def _init_pgquant_buffers(self, hidden_dim, max_tokens, device):
+        """Pre-allocate FP8+scale buffers for max batch size. Fixed GPU addresses."""
+        num_groups = hidden_dim // 128
+        self._pgq_hidden_dim = hidden_dim
+        self._pgq_max_tokens = max_tokens
+        self._pgq_res_out = torch.empty((max_tokens, hidden_dim), dtype=torch.bfloat16, device=device)
+        self._pgq_bf16 = torch.empty((max_tokens, hidden_dim), dtype=torch.bfloat16, device=device)
+        self._pgq_fp8 = torch.empty((max_tokens, hidden_dim), dtype=fp8, device=device)
+        self._pgq_scales = torch.empty((max_tokens, num_groups), dtype=torch.float32, device=device)
+
+    def custom_fused_ar_rms_with_pgquant(
+        self,
+        input: torch.Tensor,
+        residual_inp: torch.Tensor,
+        weight: torch.Tensor,
+        eps: float,
+    ):
+        """Single-kernel fused AllReduce + RMSNorm + per-group FP8 quant.
+        Returns (out_bf16, residual_out, out_fp8, group_scales).
+        Uses pre-allocated buffers at fixed GPU addresses for CUDA graph compat."""
+        if self.disabled or not self.should_custom_ar(input):
+            return None
+
+        hidden_dim = input.shape[-1]
+        M = input.numel() // hidden_dim
+
+        # Lazy init of pre-allocated buffers for max batch size
+        if not hasattr(self, '_pgq_fp8'):
+            # Allocate for max possible tokens (80 = kMaxBlocks)
+            self._init_pgquant_buffers(hidden_dim, 80, input.device)
+
+        if M > self._pgq_max_tokens:
+            return None  # Too large, fall back to normal path
+
+        # Use sliced views of pre-allocated buffers
+        res_out = self._pgq_res_out[:M]
+        bf16_out = self._pgq_bf16[:M]
+        fp8_out = self._pgq_fp8[:M]
+        scales_out = self._pgq_scales[:M]
+
+        registered = self._IS_CAPTURING and torch.cuda.is_current_stream_capturing()
+        if self._IS_CAPTURING and not torch.cuda.is_current_stream_capturing():
+            if not self._is_piecewise_cuda_graph():
+                return bf16_out, res_out, fp8_out, scales_out
+
+        ops.fused_allreduce_rmsnorm_pergroup_quant(
+            self._ptr,
+            input,
+            residual_inp,
+            res_out,
+            bf16_out,
+            fp8_out,
+            scales_out,
+            weight,
+            eps,
+            None if registered else self.input_buffer,
+        )
+
+        return bf16_out, res_out, fp8_out, scales_out
+
     def close(self):
         if not self.disabled and self._ptr:
             ops.dispose(self._ptr)

@@ -66,6 +66,19 @@ void fused_allreduce_rmsnorm_quant(fptr_t _fa,
                                    std::optional<torch::Tensor> reg_buffer,
                                    bool use_1stage);
 
+// Updated: fused_allreduce_rmsnorm now accepts optional FP8 side output buffers
+// (see rocm_ops.hpp for pybind with fp8_side_out and fp8_side_scales optional args)
+
+void fused_allreduce_rmsnorm_pergroup_quant(fptr_t _fa,
+                                             torch::Tensor& inp,
+                                             torch::Tensor& res_inp,
+                                             torch::Tensor& res_out,
+                                             torch::Tensor& out_bf16,
+                                             torch::Tensor& out_fp8,
+                                             torch::Tensor& group_scales,
+                                             torch::Tensor& w,
+                                             float eps,
+                                             std::optional<torch::Tensor> reg_buffer);
 void dispose(fptr_t _fa);
 int64_t meta_size();
 void register_input_buffer(fptr_t _fa,

@@ -414,7 +414,9 @@ void _fused_allreduce_rmsnorm(fptr_t _fa,
                               int m,
                               int n,
                               bool use_1stage,
-                              hipStream_t stream)
+                              hipStream_t stream,
+                              opus::fp8_t* fp8_side_out = nullptr,
+                              float* fp8_side_scales = nullptr)
 {
     auto fa = reinterpret_cast<aiter::CustomAllreduce*>(_fa);
     TORCH_CHECK(_is_weak_contiguous(out));
@@ -433,7 +435,9 @@ void _fused_allreduce_rmsnorm(fptr_t _fa,
             eps,                                                 \
             m,                                                   \
             n,                                                   \
-            use_1stage);                                         \
+            use_1stage,                                          \
+            fp8_side_out,                                        \
+            fp8_side_scales);                                    \
     }                                                            \
     else                                                         \
     {                                                            \
@@ -572,6 +576,65 @@ void fused_allreduce_rmsnorm_quant(fptr_t _fa,
         _fused_allreduce_rmsnorm(
             _fa, inp, res_inp, res_out, out, scale_out, w, eps, m, n, use_1stage, stream);
     }
+}
+
+// Fused AllReduce + RMSNorm + per-group FP8 quantization
+// Outputs BOTH BF16 (for model pipeline) and FP8+scales (for GEMM)
+void fused_allreduce_rmsnorm_pergroup_quant(fptr_t _fa,
+                                             torch::Tensor& inp,
+                                             torch::Tensor& res_inp,
+                                             torch::Tensor& res_out,
+                                             torch::Tensor& out_bf16,
+                                             torch::Tensor& out_fp8,
+                                             torch::Tensor& group_scales,
+                                             torch::Tensor& w,
+                                             float eps,
+                                             std::optional<torch::Tensor> reg_buffer)
+{
+    auto fa = reinterpret_cast<aiter::CustomAllreduce*>(_fa);
+    const at::hip::OptionalHIPGuardMasqueradingAsCUDA device_guard(device_of(inp));
+    auto stream = c10::hip::getCurrentHIPStreamMasqueradingAsCUDA().stream();
+    int n = w.numel();
+    int m = inp.numel() / n;
+    int size = m * n;
+
+    if(reg_buffer.has_value())
+    {
+        auto input_size = inp.numel() * inp.element_size();
+        HIP_CALL(hipMemcpyAsync(reg_buffer.value().data_ptr(),
+                                inp.data_ptr(),
+                                input_size,
+                                hipMemcpyDeviceToDevice,
+                                stream));
+    }
+
+    auto& actual_inp = reg_buffer.has_value() ? reg_buffer.value() : inp;
+    auto* ptrs = fa->get_buffer_RD(stream, actual_inp.data_ptr());
+
+    TORCH_CHECK(n == 7168, "fused_allreduce_rmsnorm_pergroup_quant only supports n=7168, got n=", n);
+    TORCH_CHECK(fa->world_size_ == 8, "Only supports world_size=8");
+
+    // Single-kernel fusion: AR + RMSNorm + per-group FP8 quant
+    // Uses the 1-stage kernel with fp8_side_out/fp8_side_scales parameters.
+    // The kernel writes:
+    //   - BF16 RMSNorm output to out_bf16
+    //   - BF16 residual to res_out
+    //   - FP8 per-group quantized output to out_fp8 (via fp8_side_out)
+    //   - Per-group scales to group_scales (via fp8_side_scales)
+    fa->dispatchFusedAllReduceRMSNorm<opus::bf16_t>(
+        stream,
+        reinterpret_cast<opus::bf16_t*>(actual_inp.data_ptr()),
+        reinterpret_cast<opus::bf16_t*>(res_inp.data_ptr()),
+        reinterpret_cast<opus::bf16_t*>(res_out.data_ptr()),
+        reinterpret_cast<opus::bf16_t*>(out_bf16.data_ptr()),
+        reinterpret_cast<opus::bf16_t*>(w.data_ptr()),
+        eps,
+        m,
+        n,
+        true,  // use_1stage
+        reinterpret_cast<opus::fp8_t*>(out_fp8.data_ptr()),
+        group_scales.data_ptr<float>()
+    );
 }
 
 void dispose(fptr_t _fa)
