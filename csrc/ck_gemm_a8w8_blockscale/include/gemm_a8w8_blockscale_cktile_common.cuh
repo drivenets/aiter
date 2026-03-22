@@ -120,10 +120,9 @@ void TileGemmComputeImpl(ck_tile::QuantGemmHostArgs& args)
 
     static constexpr ck_tile::QuantType QuantMode = ck_tile::QuantType::ABQuantGrouped;
     static constexpr bool transpose_c             = BQuantGroupSize::kN == 128;
-    static constexpr bool eight_warps =
-        BQuantGroupSize::kN == 128 &&
-        (GemmConfig::M_Warp_v * GemmConfig::N_Warp_v * GemmConfig::K_Warp_v == 8) &&
-        GemmConfig::K_Warp_Tile_v == 128;
+    // Note: ABQuantGemmPipelineAgBgCrEightWarps requires newer CK (not in Docker's 7b18f5fed base).
+    // Force V3 pipeline until CK is updated.
+    static constexpr bool eight_warps = false;
 
     using GemmShape = ck_tile::TileGemmShape<
         ck_tile::sequence<GemmConfig::M_Tile_v, GemmConfig::N_Tile_v, GemmConfig::K_Tile_v>,
@@ -135,7 +134,7 @@ void TileGemmComputeImpl(ck_tile::QuantGemmHostArgs& args)
     using TilePartitioner = ck_tile::GemmTile1DPartitioner<GemmShape>;
 
     using GemmTraits = ck_tile::TileGemmQuantTraits<
-        false, // PadM
+        true, // PadM
         PadN,
         PadK,
         false,       // PreshuffleQuant for A, not supported yet
@@ -190,12 +189,11 @@ void TileGemmComputeImpl(ck_tile::QuantGemmHostArgs& args)
                                                                     has_hot_loop_v,
                                                                     tail_number_v>;
 
+        // Note: EightWarps pipeline requires newer CK. Use V3/V2 only.
         using GemmPipeline = std::conditional_t<
-            eight_warps,
-            ck_tile::ABQuantGemmPipelineAgBgCrAsync<PipelineProblem>,
-            std::conditional_t<UseDoubleSmemBuffer && PreshuffleB,
-                               ck_tile::WPABQuantBPipelineAgBgCrV2<PipelineProblem>,
-                               ck_tile::ABQuantGemmPipelineAgBgCrCompV3<PipelineProblem>>>;
+            UseDoubleSmemBuffer && PreshuffleB,
+            ck_tile::WPABQuantBPipelineAgBgCrV2<PipelineProblem>,
+            ck_tile::ABQuantGemmPipelineAgBgCrCompV3<PipelineProblem>>;
         using GemmEpilogue = ck_tile::CShuffleEpilogue<
             ck_tile::CShuffleEpilogueProblem<ADataType,
                                              BDataType,
@@ -235,10 +233,9 @@ void TileGemmComputeImpl(ck_tile::QuantGemmHostArgs& args)
         {
             throw std::runtime_error("Wrong! Arguments not supported! Skipping gemm!\n");
         }
-        using k_attr_t = ck_tile::kernel_attr<eight_warps>;
         ck_tile::launch_kernel(
-            ck_tile::stream_config{nullptr /*stream_id*/, false /*time_kernel*/, 1 /*log_level*/},
-            ck_tile::make_kernel<GemmConfig::BlockPerCu_v, k_attr_t>(
+            ck_tile::stream_config{at::hip::getCurrentHIPStream().stream(), false /*time_kernel*/, 1 /*log_level*/},
+            ck_tile::make_kernel<GemmConfig::BlockPerCu_v>(
                 Kernel{}, grids, blocks, 0, kargs));
     };
 
