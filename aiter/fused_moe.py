@@ -265,6 +265,14 @@ def fused_moe_(
     quant_type = quant_remap.get(quant_type, quant_type)
     q_dtype_w = w1.dtype
     q_dtype_a = w1.dtype if w1.dtype != torch.uint32 else dtypes.fp8
+    # If input is already FP8-quantized (e.g. from FP8 dispatch) with block scale,
+    # use FP8 as activation dtype to skip redundant re-quantization
+    if (
+        quant_type == QuantType.per_1x128
+        and hidden_states.dtype == dtypes.fp8
+        and a1_scale is not None
+    ):
+        q_dtype_a = dtypes.fp8
     bf16_fp8_bound = 512
     if quant_type == QuantType.per_1x32:
         if activation == ActivationType.Swiglu:
@@ -535,9 +543,6 @@ def get_block_size_M(token, topk, expert, inter_dim):
     tileN = 128
     tgN = (inter_dim + tileN - 1) // tileN
     support_list = [32, 64, 128]
-    # WARP32 kernel uses MPerBlock=64; block_size_M must be >= 64
-    if os.environ.get("AITER_MOE_WARP32", "0") != "0":
-        support_list = [el for el in support_list if el >= 64]
 
     tmp = []
     for el in support_list:
@@ -625,17 +630,10 @@ def nextPow2(n):
 
 def get_padded_M(M):
     padded_m = M
-    if M >= 1 and M <= 16:
-        # decoding policy may be changed in the future.
+    if M < 32768:
         padded_m = nextPow2(padded_m)
-    elif M < 1024:
-        padded_m = nextPow2(padded_m)
-    elif M < 2048:
-        padded_m = 1024
-    elif M < 16384:
-        padded_m = 2048
     else:
-        padded_m = 16384
+        padded_m = 32768
     return padded_m
 
 
@@ -864,10 +862,7 @@ def get_2stage_cfgs(
             elif q_type == QuantType.per_Token and q_dtype_w == dtypes.i8:
                 run_1stage = token > 32
             elif q_type == QuantType.per_Token and q_dtype_w == dtypes.fp8:
-                if get_gfx() == "gfx950" and not doweight_stage1:
-                    run_1stage = inter_dim == 192
-                else:
-                    run_1stage = token > 16
+                run_1stage = token > 16 or inter_dim % 128 != 0
             elif q_type != QuantType.per_1x32:
                 run_1stage = token < 256
 
@@ -945,17 +940,12 @@ def get_2stage_cfgs(
         and q_type == QuantType.per_1x32
         and activation == ActivationType.Swiglu
     ):
-        # Force split_k=1 for Swiglu: the fused gate_up kernel handles
-        # Swiglu internally.  split_k>1 uses kFFN_gemm1_split_k mode which
-        # outputs raw interleaved GEMM sums — Python-side Swiglu would need
-        # a de-interleave step that isn't implemented yet.
         return MOEMetadata(
             functools.partial(
                 cktile_moe_stage1,
                 n_pad_zeros=intermediate_pad // 64 * 64 * (2 if use_g1u1 else 1),
                 k_pad_zeros=hidden_pad // 128 * 128,
                 activation=activation,
-                split_k=1,
             ),
             functools.partial(
                 cktile_moe_stage2,
@@ -1140,7 +1130,19 @@ def fused_moe_2stages(
         a1_scale = torch.ones([M, N // 32], dtype=dtypes.fp8_e8m0, device=a1.device)
 
     elif quant_type == QuantType.per_1x32:
-        if token_num <= token_num_quant_moe_sort_switch:
+        _n_lane = 32 if os.environ.get("AITER_MOE_WARP32", "0") != "0" else 16
+        if hidden_states.dtype == dtypes.fp4x2 and a1_scale is not None:
+            # Input is already quantized to fp4x2 (e.g., from FP4 dispatch),
+            # skip re-quantization, only sort the scale
+            a1 = hidden_states
+            a1_scale = fp4_utils.moe_mxfp4_sort(
+                a1_scale,
+                sorted_ids=sorted_ids,
+                num_valid_ids=num_valid_ids,
+                token_num=token_num,
+                block_size=block_size_M,
+            )
+        elif token_num <= token_num_quant_moe_sort_switch:
             a1, a1_scale = fused_dynamic_mxfp4_quant_moe_sort(
                 hidden_states,
                 sorted_ids=sorted_ids,
@@ -1764,12 +1766,6 @@ def cktile_moe_stage1(
     if split_k > 1:
         if activation == ActivationType.Silu:
             aiter.silu_and_mul(out, tmp_out)  # TODO: support fp32 splitk
-        elif activation == ActivationType.Swiglu:
-            # GPT-OSS custom Swiglu: gate * sigmoid(alpha*gate) * (up + 1) with clamping
-            half_n = tmp_out.shape[-1] // 2
-            gate = tmp_out[..., :half_n].clamp(max=7.0)
-            up = tmp_out[..., half_n:].clamp(min=-7.0, max=7.0)
-            out.copy_((gate * torch.sigmoid(1.702 * gate) * (up + 1)).to(out.dtype))
         else:
             aiter.gelu_and_mul(out, tmp_out)
     return out
@@ -1799,7 +1795,6 @@ def cktile_moe_stage2(
 ):
     token_num = a2.shape[0]
     D = w2.shape[1]
-    # max_num_tokens_padded = sorted_expert_ids.shape[0]*block_size
 
     if _DETERMINISTIC_MOE:
         return _cktile_moe_stage2_deterministic(
