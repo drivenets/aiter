@@ -519,6 +519,9 @@ def get_block_size_M(token, topk, expert, inter_dim):
     tileN = 128
     tgN = (inter_dim + tileN - 1) // tileN
     support_list = [32, 64, 128]
+    # WARP32 kernel uses MPerBlock=64; block_size_M must be >= 64
+    if os.environ.get("AITER_MOE_WARP32", "0") != "0":
+        support_list = [el for el in support_list if el >= 64]
 
     tmp = []
     for el in support_list:
