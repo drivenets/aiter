@@ -40,6 +40,7 @@ class cktile_moe_2stage_gemm_codegen:
         mul_routed_weight_stage,
         is_split_k,
         istune=False,
+        has_bias=None,
     ):
         self.working_path = working_path
         self.impl_path = os.path.join(working_path, "impl")
@@ -56,6 +57,8 @@ class cktile_moe_2stage_gemm_codegen:
         self.is_split_k = is_split_k
         self.activation = act_dict[activation]
         self.mul_routed_weight_stage = mul_routed_weight_stage
+        # has_bias: if explicitly set, use it; otherwise derive from activation
+        self._has_bias = has_bias
 
     def get_suffix(self, stage: int) -> str:
         return ("_").join(
@@ -283,7 +286,7 @@ template torch::Tensor
                 "(acc_data_type)": dtype_dict[self.acc_dtype],
                 "(c_data_type)": dtype_dict[self.c_dtype],
                 "(activation)": self.activation,
-                "(has_bias)": "true" if self.activation == 2 else "false",
+                "(has_bias)": "true" if (self._has_bias if self._has_bias is not None else self.activation == 2) else "false",
                 "(split_k)": "true" if self.is_split_k else "false",
             }
             format_args = {str(key): value.name for key, value in mapping.items()}
@@ -644,10 +647,16 @@ if __name__ == "__main__":
     gen_dispatch_files = []
     gen_manifest_files = []
 
-    for a_type, c_dtype, act_type, is_split_k in itertools.product(
-        a_types, c_dtypes, act_types, is_split_k_l
+    # For Swiglu: generate both with and without bias (model uses bias,
+    # but standalone tests / other models may not pass bias)
+    has_bias_list = [False, True] if "swiglu" in act_types else [False]
+
+    for a_type, c_dtype, act_type, is_split_k, has_bias in itertools.product(
+        a_types, c_dtypes, act_types, is_split_k_l, has_bias_list
     ):
-        has_bias = True if act_type == "swiglu" else False
+        # Only generate has_bias=True for Swiglu (other activations never use bias)
+        if act_type != "swiglu" and has_bias:
+            continue
 
         # a8w8 do not support
         if a_type in ["fp8", "bf8"] and is_split_k:
@@ -662,6 +671,7 @@ if __name__ == "__main__":
             2,
             is_split_k,
             False,
+            has_bias=has_bias,
         )
         # gen all instances for gemm1 and gemm2
         _, gemm1_kernel_list = get_gemm1_kernels_list(

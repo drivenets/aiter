@@ -920,12 +920,17 @@ def get_2stage_cfgs(
         and q_type == QuantType.per_1x32
         and activation == ActivationType.Swiglu
     ):
+        # Force split_k=1 for Swiglu: the fused gate_up kernel handles
+        # Swiglu internally.  split_k>1 uses kFFN_gemm1_split_k mode which
+        # outputs raw interleaved GEMM sums — Python-side Swiglu would need
+        # a de-interleave step that isn't implemented yet.
         return MOEMetadata(
             functools.partial(
                 cktile_moe_stage1,
                 n_pad_zeros=intermediate_pad // 64 * 64 * (2 if use_g1u1 else 1),
                 k_pad_zeros=hidden_pad // 128 * 128,
                 activation=activation,
+                split_k=1,
             ),
             functools.partial(
                 cktile_moe_stage2,
@@ -1729,6 +1734,12 @@ def cktile_moe_stage1(
     if split_k > 1:
         if activation == ActivationType.Silu:
             aiter.silu_and_mul(out, tmp_out)  # TODO: support fp32 splitk
+        elif activation == ActivationType.Swiglu:
+            # GPT-OSS custom Swiglu: gate * sigmoid(alpha*gate) * (up + 1) with clamping
+            half_n = tmp_out.shape[-1] // 2
+            gate = tmp_out[..., :half_n].clamp(max=7.0)
+            up = tmp_out[..., half_n:].clamp(min=-7.0, max=7.0)
+            out.copy_((gate * torch.sigmoid(1.702 * gate) * (up + 1)).to(out.dtype))
         else:
             aiter.gelu_and_mul(out, tmp_out)
     return out
