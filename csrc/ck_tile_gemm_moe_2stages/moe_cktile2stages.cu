@@ -263,7 +263,9 @@ torch::Tensor cktile_moe_gemm1(torch::Tensor& XQ,
     }
     else
     {
-        TORCH_CHECK(false, "Unsupported scales/output dtype!");
+        TORCH_CHECK(false, "Unsupported scales/output dtype! XQ.dtype=", XQ.dtype(),
+                    " WQ.dtype=", WQ.dtype(), " Y.dtype=", Y.dtype(),
+                    " torch_fp4x2=", torch_fp4x2, " torch_fp8=", torch_fp8);
     }
     return Y;
 }
@@ -365,7 +367,9 @@ torch::Tensor cktile_moe_gemm2(torch::Tensor& XQ,
     }
     else
     {
-        TORCH_CHECK(false, "Unsupported scales/output dtype!");
+        TORCH_CHECK(false, "Unsupported scales/output dtype! (gemm2) XQ.dtype=", XQ.dtype(),
+                    " WQ.dtype=", WQ.dtype(), " Y.dtype=", Y.dtype(),
+                    " torch_fp4x2=", torch_fp4x2, " torch_fp8=", torch_fp8);
     }
     return Y;
 }

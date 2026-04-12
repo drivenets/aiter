@@ -31,7 +31,8 @@ const constexpr auto torch_fp8 = at::ScalarType::Float8_e4m3fnuz;
 #else
 inline at::ScalarType get_torch_fp8()
 {
-    static const auto value = isGPUArch({"gfx94"}) ? at::ScalarType::Float8_e4m3fnuz : at::ScalarType::Float8_e4m3fn;
+    static const auto value =
+        isGPUArch({"gfx94", "gfx95"}) ? at::ScalarType::Float8_e4m3fnuz : at::ScalarType::Float8_e4m3fn;
     return value;
 }
 #define torch_fp8 get_torch_fp8()
