@@ -420,6 +420,8 @@ def _fused_qk_rope_reshape_and_cache_kernel(
     value_cache_stride_h,
     value_cache_stride_d,
     value_cache_stride_b,
+    value_cache_stride_slot_chunk,  # prereq-patch for 5D value_cache layout (upstream 4491d152f)
+    value_cache_stride_x,
     zeros_out_stride_t,
     zeros_out_stride_h,
     zeros_out_stride_d,
@@ -733,6 +735,8 @@ def _fused_qk_rope_reshape_and_cache_tiled_kernel(
     value_cache_stride_h,
     value_cache_stride_d,
     value_cache_stride_b,
+    value_cache_stride_slot_chunk,  # prereq-patch for 5D value_cache layout (upstream 4491d152f)
+    value_cache_stride_x,
     zeros_out_stride_t,
     zeros_out_stride_h,
     zeros_out_stride_d,
