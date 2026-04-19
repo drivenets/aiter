@@ -306,6 +306,7 @@ float fmha_fwd_ck(mha_fwd_args a, const ck_tile::stream_config& s)
                        a.cu_seqlen_k_ptr,
                        a.block_scale_seqstart_q_ptr,
                        a.block_scale_seqstart_k_ptr,
+                       nullptr, // seqstart_v_scale_ptr (CK upstream added field; not surfaced in aiter yet)
                        a.sink_ptr,
                        a.seqlen_q,
                        a.seqlen_k,
@@ -323,6 +324,9 @@ float fmha_fwd_ck(mha_fwd_args a, const ck_tile::stream_config& s)
                        a.stride_bias,
                        a.stride_randval,
                        a.stride_o,
+                       0, // stride_q_descale (CK upstream added; not surfaced in aiter yet)
+                       0, // stride_k_descale
+                       0, // stride_v_descale
                        a.nhead_stride_q,
                        a.nhead_stride_k,
                        a.nhead_stride_v,
