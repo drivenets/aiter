@@ -7,7 +7,7 @@ import argparse
 
 defaultDtypes = {
     "gfx942": {"fp8": torch.float8_e4m3fnuz},
-    "gfx950": {"fp8": torch.float8_e4m3fn},
+    "gfx950": {"fp8": torch.float8_e4m3fnuz},  # DN: match C++ dispatch (py_itfs_common.h adds gfx95 to fnuz)
     "gfx1250": {"fp8": torch.float8_e4m3fn},
 }
 
