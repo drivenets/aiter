@@ -136,7 +136,7 @@ mha_fwd_args get_ck_fmha_varlen_fwd_args(bool has_lse,
                         static_cast<int>(bias_type),
                         has_lse,
                         static_cast<int>(qscale_type),
-                        mask.sink > 0, // hsa_sink
+                        (sink_ptr != nullptr), // has_sink: kernel dispatch must follow sink_ptr presence, not mask.sink (the old formula required sink_size>0 which GPT-OSS doesn't set)
                         q.data_ptr(),
                         k.data_ptr(),
                         v.data_ptr(),
@@ -496,7 +496,9 @@ mha_varlen_fwd(
         std::string mask_identify = "b:" + std::to_string(window_size_left) + "," + std::to_string(window_size_right) + "," + std::to_string(sink_size);
         mask = mask_info::decode(mask_identify, max_seqlen_q, max_seqlen_k); // local
     }
-    bool has_sink = mask.sink > 0;
+    // GPT-OSS style per-head learnable sinks pass sink_ptr but leave sink_size=0.
+    // Dispatch on sink_ptr presence instead.
+    bool has_sink = sink_ptr.has_value();
     CHECK_SHAPE(q, total_q, num_heads, head_size_q);
     if (!paged_KV) {
         const int total_k = k.size(0);

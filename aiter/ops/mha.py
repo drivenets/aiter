@@ -2836,9 +2836,12 @@ def _mha_batch_prefill(
         q_descale,
         k_descale,
         v_descale,
-        # NOTE: kv_block_descale is accepted by the Python wrapper but NOT by the
-        # C++ op (mha_batch_prefill_pybind).  Passing it here shifts all subsequent
-        # positional args and causes sink_ptr to land in the gen slot.
+        # The C++ op DOES accept kv_block_descale (after v_descale and before
+        # kv_last_page_lens). The old NOTE that it was dropped is stale — the
+        # rebuilt kernel on gptoss-on-latest expects it as positional arg 24.
+        # Omitting it caused seqlen_k to land in the block_table slot and fail
+        # with "block_table must be 2d" once sglang passed a real seqlen_k.
+        kv_block_descale,
         kv_last_page_lens,
         block_table,
         seqlen_k,

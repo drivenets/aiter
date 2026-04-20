@@ -965,6 +965,16 @@ __inline__ __device__ void _paged_attention_ll4mi_reduce_kernel(
             max_logit = fmaxf(max_logit, __shfl_xor(max_logit, mask));
         }
 
+        // DN fix: include sink in global max so partition rescaling and
+        // sink contribution use the same basis. Otherwise when sink_value
+        // exceeds max(qk), the partition exp_sums under-scale and the sink
+        // term over-contributes, collapsing the output (garbage tokens for
+        // GPT-OSS).
+        if(sink_ptr != nullptr)
+        {
+            max_logit = fmaxf(max_logit, sink_ptr[head_idx]);
+        }
+
         const float* exp_sums_ptr = exp_sums +
                                     (seq_idx * MTP + mtp) * num_heads * max_num_partitions +
                                     head_idx * max_num_partitions;

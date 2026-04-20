@@ -109,7 +109,7 @@ mha_fwd_args get_ck_fmha_fwd_args(bool has_lse,
                         static_cast<int>(bias_type),
                         has_lse,
                         static_cast<int>(qscale_type),
-                        mask.sink > 0, // has_sink
+                        (sink_ptr != nullptr), // has_sink: follow sink_ptr presence (GPT-OSS passes sinks with sink_size=0)
                         q.data_ptr(),
                         k.data_ptr(),
                         v.data_ptr(),
