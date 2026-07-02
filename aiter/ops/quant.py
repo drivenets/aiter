@@ -767,6 +767,40 @@ def dynamic_per_group_scaled_quant_fp4(
 
 
 @compile_ops("module_quant", develop=True)
+def dynamic_per_group_scaled_dequant(
+    out: torch.Tensor,
+    input: torch.Tensor,
+    scales: torch.Tensor,
+    group_size: int = 32,
+    shuffle_scale: bool = False,
+) -> None:
+    """Native MXFP4 dequant (reverse of ``dynamic_per_group_scaled_quant``).
+
+    Decodes packed e2m1 fp4 ``input`` ``[N, D/2]`` (``dtypes.fp4x2`` /
+    ``torch.uint8``) plus e8m0 group scales ``scales`` ``[N, D/group_size]``
+    (``dtypes.fp8_e8m0`` / ``torch.uint8``) into ``out`` ``[N, D]``
+    (``dtypes.bf16`` or ``dtypes.fp32``). Uses the gfx950 hardware fp4->f32
+    intrinsic with the reconstructed per-group scale.
+
+    Contract:
+      * ``group_size`` in {32, 64, 128};
+      * ``D % group_size == 0`` (asserted);
+      * ``shuffle_scale=False`` only (row-contiguous e8m0 scale layout, as
+        returned by ``per_1x32_f4_quant_hip(shuffle=False)``);
+      * ``out`` dtype must be ``bf16`` or ``fp32``;
+      * ``out``/``input`` must be contiguous.
+
+    Subnormal-flush (documented hardware behavior, not a bug): the gfx950
+    intrinsic flushes subnormal f32 results (|x| < 2^-126) to +/-0.0, whereas
+    the pure-torch reference (``fp4_utils.mxfp4_to_f32`` x ``e8m0_to_f32``)
+    preserves them. This divergence is only reachable via raw e8m0 scale bytes
+    0 and 1, which the encoder never emits for real data; the kernel is
+    therefore bit-exact vs the reference for all encoder-produced inputs.
+    """
+    ...
+
+
+@compile_ops("module_quant", develop=True)
 def smooth_per_token_scaled_quant(
     out: torch.Tensor,
     input: torch.Tensor,

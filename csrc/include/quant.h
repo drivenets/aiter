@@ -34,6 +34,16 @@ void dynamic_per_group_scaled_quant(aiter_tensor_t& out,         // [..., d]
                                     std::optional<aiter_tensor_t> num_rows     = std::nullopt,
                                     int num_rows_factor                        = 1);
 
+// MXFP4 dequant: reverse of dynamic_per_group_scaled_quant. Decodes packed
+// e2m1 fp4 [N, D/2] + e8m0 group scales [N, D/group_size] into bf16/fp32
+// [N, D]. Uses the gfx950 hardware fp4->f32 intrinsic. shuffle_scale must be
+// false (row-contiguous e8m0 scale layout).
+void dynamic_per_group_scaled_dequant(aiter_tensor_t& out,          // [N, D]
+                                      const aiter_tensor_t& input,  // [N, D/2]
+                                      const aiter_tensor_t& scales, // [N, D/gs]
+                                      int group_size    = 32,
+                                      bool shuffle_scale = false);
+
 // Backward-compat fp4-only entry; delegates to dynamic_per_group_scaled_quant.
 void dynamic_per_group_scaled_quant_fp4(aiter_tensor_t& out,         // [..., d]
                                         const aiter_tensor_t& input, // [..., d]

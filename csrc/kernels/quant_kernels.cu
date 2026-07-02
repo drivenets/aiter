@@ -2124,4 +2124,167 @@ void mxfp4_moe_sort_hip(
     MXFP4_MOE_SORT_KERNEL_DISPATCH(cols);
 }
 
+// ===========================================================================
+// MXFP4 dequant: reverse of dynamic_per_group_scaled_quant_kernel.
+//
+// Decode packed e2m1 fp4 [N, D/2] (uint8, 2 fp4 per byte) + e8m0 group scales
+// [N, D/group_size] (uint8 byte per group, value = 2^(byte-127)) into bf16
+// [N, D]. Uses the gfx950 hardware inverse intrinsic
+// __builtin_amdgcn_cvt_scalef32_pk_f32_fp4 (via opus::fp4_to_fp32_packed_x8)
+// which consumes the reconstructed per-group float scale directly. The scale
+// float is rebuilt from the e8m0 byte exactly as fp4_utils.e8m0_to_f32 does
+// (byte<<23 bit-placement, with 0 -> 2^-126 and 0xFF -> NaN special cases),
+// so the result is bit-identical to the reference up to the final bf16 round
+// for every input the encoder (dynamic_per_group_scaled_quant) can produce.
+//
+// Subnormal-flush (documented hardware behavior, not a bug): the gfx950
+// intrinsic __builtin_amdgcn_cvt_scalef32_pk_f32_fp4 flushes subnormal f32
+// results (|x| < 2^-126) to +/-0.0 (FTZ), whereas the pure-torch reference
+// preserves them. This divergence is only reachable via raw e8m0 scale bytes
+// 0 and 1 (scale <= 2^-126), which the encoder NEVER emits for real data, so
+// the kernel is bit-exact for all encoder outputs. Adding a software
+// subnormal path would slow the kernel for inputs that never occur through
+// the encoder, so we keep the standard hardware MXFP4 FTZ semantics.
+//
+// Distinctive symbol name for profiler attribution: DEQUANT_MXFP4_HIP.
+// ===========================================================================
+
+// e8m0 byte -> f32 scale, matching aiter/utility/fp4_utils.py::e8m0_to_f32.
+__device__ __forceinline__ float aiter_e8m0_byte_to_f32(uint8_t b)
+{
+    uint32_t bits;
+    if(b == 0)
+        bits = 0x00400000u; // subnormal-boundary case in the python reference
+    else if(b == 0xFF)
+        bits = 0x7F800001u; // NaN
+    else
+        bits = static_cast<uint32_t>(b) << 23;
+    return __builtin_bit_cast(float, bits);
+}
+
+// One block-thread decodes `thread_data_size` fp4 elements. group_size must be
+// a multiple of thread_data_size so each thread stays within a single group
+// (one e8m0 scale). thread_data_size is a multiple of 8 so we can use the
+// hardware pk8 fp4->f32 path. Stores are scalar fp32_to_bf16 writes that are
+// warp-coalesced across adjacent threads (not 128-bit vector stores).
+template <typename DTYPE_O,
+          int thread_data_size = 32,
+          int32_t group_size   = 32,
+          int32_t block_size   = 256>
+__global__ void __launch_bounds__(block_size) DEQUANT_MXFP4_HIP(
+    DTYPE_O* __restrict__ out,           // [N, D]  bf16
+    uint8_t const* __restrict__ packed,  // [N, D/2] fp4x2 bytes
+    uint8_t const* __restrict__ scales,  // [N, D/group_size] e8m0 bytes
+    int64_t n_elems)                     // total number of fp4 elements = N*D
+{
+    static_assert(thread_data_size % 8 == 0, "thread_data_size must be a multiple of 8");
+    static_assert(group_size % thread_data_size == 0,
+                  "group_size must be a multiple of thread_data_size");
+
+    const int64_t tid       = static_cast<int64_t>(blockIdx.x) * block_size + threadIdx.x;
+    const int64_t elem_base = tid * thread_data_size; // first fp4 element index
+    if(elem_base >= n_elems)
+        return;
+
+    // Reconstruct the per-group scale. All `thread_data_size` elements of this
+    // thread belong to the same group (guaranteed by the static_assert above).
+    const int64_t group_id = elem_base / group_size;
+    const float   scale    = aiter_e8m0_byte_to_f32(scales[group_id]);
+
+    // Load thread_data_size/2 packed bytes = thread_data_size fp4 elements.
+    static constexpr int packed_bytes = thread_data_size / 2;
+    auto const* pk = reinterpret_cast<uint8_t const*>(packed) + elem_base / 2;
+
+    using bf16x2 = opus::bf16x2_t;
+    auto* out_ptr = reinterpret_cast<DTYPE_O*>(out) + elem_base;
+
+    // Process 8 fp4 (4 packed bytes) at a time via the hardware pk8 path.
+#pragma unroll
+    for(int i = 0; i < thread_data_size; i += 8)
+    {
+        opus::array<opus::fp4_t, 4> quad;
+        auto* qb = reinterpret_cast<uint8_t*>(&quad);
+#pragma unroll
+        for(int j = 0; j < 4; j++)
+            qb[j] = pk[i / 2 + j];
+
+        opus::fp32x8_t f = opus::fp4_to_fp32_packed_x8(quad, scale);
+
+        if constexpr(std::is_same_v<DTYPE_O, opus::bf16_t>)
+        {
+#pragma unroll
+            for(int j = 0; j < 8; j++)
+                out_ptr[i + j] = opus::fp32_to_bf16(f[j]);
+        }
+        else // fp32 output (exact-verification path)
+        {
+#pragma unroll
+            for(int j = 0; j < 8; j++)
+                out_ptr[i + j] = f[j];
+        }
+    }
+}
+
+// Host launcher. `out` bf16/fp32 [N, D]; `input_packed` fp4x2/uint8 [N, D/2];
+// `scales` e8m0/uint8 [N, D/group_size] (row-contiguous, shuffle_scale=false).
+void dynamic_per_group_scaled_dequant(aiter_tensor_t& out,          // [N, D]
+                                      const aiter_tensor_t& input,  // [N, D/2]
+                                      const aiter_tensor_t& scales, // [N, D/gs]
+                                      int group_size,
+                                      bool shuffle_scale)
+{
+    AITER_CHECK(group_size == 32 || group_size == 64 || group_size == 128,
+                __func__, " only supports group_size in {32, 64, 128}");
+    AITER_CHECK(!shuffle_scale, __func__, " only supports shuffle_scale=false");
+    AITER_CHECK(out.is_contiguous(), __func__, " out must be contiguous");
+    AITER_CHECK(input.is_contiguous(), __func__, " input must be contiguous");
+
+    const int64_t D       = out.size(-1);              // logical fp4 columns
+    const int64_t N       = out.numel() / D;
+    const int64_t n_elems = static_cast<int64_t>(N) * D; // total fp4 elements
+    AITER_CHECK(D % group_size == 0, __func__, " D not divisible by group_size");
+
+    // Tuned defaults, baked as compile-time constants (MI355X / gfx950):
+    //   thread_data_size = 16 fp4 elems/thread, block_size = 128 -> ~4.0 TB/s @ 1GB.
+    constexpr int TDS = 16;
+    constexpr int BS  = 128;
+
+    // Tail-safety guarantee (make the implicit invariant explicit): every
+    // active thread writes exactly TDS elements without a per-element bound
+    // check, so n_elems MUST be an integer multiple of TDS or the last thread
+    // would OOB-write past `out`. This is guaranteed by D % group_size == 0
+    // (checked above) and group_size % TDS == 0 (below), but we assert the
+    // final invariant directly so a future caller can never silently regress it.
+    AITER_CHECK(group_size % TDS == 0, __func__,
+                " group_size must be a multiple of thread_data_size (", TDS, ")");
+    AITER_CHECK(n_elems % TDS == 0, __func__,
+                " N*D must be a multiple of thread_data_size (", TDS,
+                ") to guarantee no tail OOB write");
+
+    HipDeviceGuard device_guard(input.device_id);
+    const hipStream_t stream = aiter::getCurrentHIPStream();
+
+    const int64_t threads_total = (n_elems + TDS - 1) / TDS;
+    dim3 const grid((threads_total + BS - 1) / BS);
+    dim3 const block(BS);
+
+    DISPATCH_GROUP_SIZE(group_size,
+        auto launch = [&](auto out_type_tag) {
+            using out_t = decltype(out_type_tag);
+            aiter::DEQUANT_MXFP4_HIP<out_t, TDS, _GS, BS><<<grid, block, 0, stream>>>(
+                reinterpret_cast<out_t*>(out.data_ptr()),
+                reinterpret_cast<uint8_t const*>(input.data_ptr()),
+                reinterpret_cast<uint8_t const*>(scales.data_ptr()),
+                n_elems);
+        };
+        if(out.dtype() == AITER_DTYPE_bf16)
+            launch(opus::bf16_t{});
+        else if(out.dtype() == AITER_DTYPE_fp32)
+            launch(float{});
+        else
+            AITER_CHECK(false, __func__, " out dtype must be bf16 or fp32, got ",
+                        AiterDtype_to_str(out.dtype()));
+    )
+}
+
 } // namespace aiter

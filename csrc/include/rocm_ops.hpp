@@ -1497,6 +1497,13 @@ namespace py = pybind11;
           py::arg("shuffle_scale")   = true,                             \
           py::arg("num_rows")        = std::nullopt,                     \
           py::arg("num_rows_factor") = 1);                               \
+    m.def("dynamic_per_group_scaled_dequant",                            \
+          &aiter::dynamic_per_group_scaled_dequant,                      \
+          py::arg("out"),                                                \
+          py::arg("input"),                                              \
+          py::arg("scales"),                                             \
+          py::arg("group_size")      = 32,                               \
+          py::arg("shuffle_scale")   = false);                          \
     m.def("smooth_per_token_scaled_quant",                               \
           &aiter::smooth_per_token_scaled_quant,                         \
           py::arg("out"),                                                \
